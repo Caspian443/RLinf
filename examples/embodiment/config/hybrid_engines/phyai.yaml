@@ -1,4 +1,6 @@
 # Initial PhyAI integration: one world-size=1 engine per rollout Ray actor.
+# Training runs must use a root-level weight_syncer with type: bucket. Patch
+# sync is incompatible with PhyAI's fused and sharded parameter layout.
 rollout_backend: phyai
 enable_offload: False
 

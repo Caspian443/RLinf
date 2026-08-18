@@ -14,6 +14,7 @@
 
 """PhyAI-backed embodied rollout worker."""
 
+import gc
 from typing import Any, Literal
 
 import torch
@@ -22,6 +23,24 @@ from omegaconf import DictConfig, OmegaConf
 from rlinf.config import torch_dtype_from_precision
 from rlinf.scheduler import Worker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+
+
+class _PhyAIWeightTarget(torch.nn.Module):
+    """Adapt bucket syncer's ``load_state_dict`` calls to a PhyAI Engine."""
+
+    def __init__(self, engine: Any) -> None:
+        super().__init__()
+        self.engine = engine
+
+    def load_state_dict(
+        self,
+        state_dict: dict[str, torch.Tensor],
+        strict: bool = True,
+        assign: bool = False,
+    ) -> Any:
+        del strict, assign
+        self.engine.update_weights(state_dict)
+        return None
 
 
 class PhyAIWorker(MultiStepRolloutWorker):
@@ -33,9 +52,9 @@ class PhyAIWorker(MultiStepRolloutWorker):
     action inference are replaced with the PhyAI engine path.
 
     The current PhyAI pi0.5 engine returns actions only. Consequently this
-    first integration supports frozen-checkpoint evaluation, but deliberately
-    rejects training rollout and hot weight synchronization until PhyAI can
-    return RLinf's behavior-policy tensors and update its fused weights.
+    first integration supports evaluation and hot weight synchronization, but
+    deliberately rejects training rollout until PhyAI returns RLinf's
+    behavior-policy tensors.
     """
 
     def __init__(self, cfg: DictConfig):
@@ -46,6 +65,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._engine = None
         self._processor = None
         self._request_cls = None
+        self._weight_target = None
         self._engine_device: torch.device | None = None
         self._engine_dtype: torch.dtype | None = None
 
@@ -58,7 +78,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
             raise NotImplementedError(
                 "PhyAI training rollout is not implemented yet: Engine.step() "
                 "must first expose prev_logprobs, prev_values, denoise state, "
-                "and forward_inputs, and the engine needs hot weight updates. "
+                "and forward_inputs. "
                 "Set runner.only_eval: true for the initial integration."
             )
         if self.enable_offload:
@@ -182,6 +202,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
             raise
 
         self._engine = engine
+        self._weight_target = _PhyAIWeightTarget(engine)
         self._processor = processor
         self._request_cls = PI05Request
 
@@ -300,12 +321,78 @@ class PhyAIWorker(MultiStepRolloutWorker):
         """PhyAI pi0.5 currently has no value head."""
         return None
 
-    async def sync_model_from_actor(self):
-        """Reject weight sync until PhyAI supports in-place hot updates."""
-        raise NotImplementedError(
-            "PhyAI hot weight synchronization is not implemented. The engine "
-            "currently loads a frozen checkpoint during init_worker()."
+    @Worker.timer("sync_model_from_actor")
+    async def sync_model_from_actor(self) -> None:
+        """Receive actor buckets and hot-update the in-process PhyAI engine."""
+        from rlinf.hybrid_engines.weight_syncer.bucket_syncer import (
+            BucketWeightSyncer,
         )
+
+        if self._engine is None or self._weight_target is None:
+            raise RuntimeError("init_worker() must be called before weight sync.")
+        if self.weight_syncer is None:
+            raise RuntimeError("PhyAI weight sync requires weight_syncer config.")
+        if not isinstance(self.weight_syncer, BucketWeightSyncer):
+            raise NotImplementedError(
+                "PhyAI currently supports only bucket weight synchronization. "
+                "Patch synchronization assumes identical sender/receiver state "
+                "dict layouts, which is incompatible with PhyAI fused weights."
+            )
+
+        async def recv_func() -> Any:
+            return await self.broadcast(
+                None,
+                groups=[
+                    (self.actor_group_name, self.actor_weight_src_rank),
+                    (self._group_name, self._weight_sync_rollout_ranks),
+                ],
+                src=(self.actor_group_name, self.actor_weight_src_rank),
+                async_op=True,
+                options=self._sync_weight_comm_options,
+            ).async_wait()
+
+        async def send_func(data: Any) -> None:
+            if not self._weight_sync_is_sender:
+                return
+            actor_world_size = self.placement.get_world_size("actor")
+            for actor_rank in range(actor_world_size):
+                await self.send(
+                    data,
+                    dst_group_name=self.actor_group_name,
+                    dst_rank=actor_rank,
+                    async_op=True,
+                    options=self._sync_weight_comm_options,
+                ).async_wait()
+
+        if not self.weight_syncer.receiver_initialized():
+            await self.weight_syncer.init_receiver(
+                state_dict=None,
+                recv=recv_func,
+                send=send_func,
+            )
+
+        self._engine.begin_weight_update()
+        try:
+            applied_version = await self.weight_syncer.apply(
+                self._weight_target,
+                recv_func,
+            )
+            report = self._engine.finish_weight_update()
+        except Exception:
+            self._engine.abort_weight_update()
+            raise
+
+        self.version = applied_version
+        if self.finished_episodes is None:
+            self.finished_episodes = (
+                self.version * self.total_num_train_envs * self.rollout_epoch
+            )
+        self.log_info(
+            "PhyAI hot weight update applied: "
+            f"version={self.version}, loaded={len(report.loaded)}."
+        )
+        gc.collect()
+        self.torch_platform.empty_cache()
 
     def set_global_step(self, global_step: int) -> None:
         """Record the policy version without forwarding to an HF model."""
@@ -318,5 +405,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self.log_info(f"Shutting down PhyAI engine on rollout rank {self._rank}.")
         self._engine.close()
         self._engine = None
+        self._weight_target = None
         self._processor = None
         self._request_cls = None
