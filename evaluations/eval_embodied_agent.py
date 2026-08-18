@@ -42,8 +42,8 @@ def main(cfg) -> None:
     cluster = Cluster(cluster_cfg=cfg.cluster)
     component_placement = HybridComponentPlacement(cfg, cluster)
 
-    # Create rollout worker group. Select the worker by ``rollout_backend``:
-    # only ``sglang`` and ``huggingface`` are supported here (vllm is intentionally not wired in);
+    # Create rollout worker group. Select the worker by ``rollout_backend``.
+    # vLLM is intentionally not wired into embodied evaluation.
     rollout_placement = component_placement.get_strategy("rollout")
     rollout_backend = cfg.rollout.get("rollout_backend", "huggingface")
     # Default env worker; RTC on the huggingface path overrides it below.
@@ -75,6 +75,12 @@ def main(cfg) -> None:
         # Create rollout worker group
         rollout_placement = component_placement.get_strategy("rollout")
         rollout_group = rollout_worker_cls.create_group(cfg).launch(
+            cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
+        )
+    elif rollout_backend == "phyai":
+        from rlinf.workers.rollout.phyai import PhyAIWorker
+
+        rollout_group = PhyAIWorker.create_group(cfg).launch(
             cluster, name=cfg.rollout.group_name, placement_strategy=rollout_placement
         )
     else:

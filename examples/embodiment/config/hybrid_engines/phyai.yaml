@@ -1,0 +1,17 @@
+# Initial PhyAI integration: one world-size=1 engine per rollout Ray actor.
+rollout_backend: phyai
+enable_offload: False
+
+phyai:
+  plugin: pi05
+  # Defaults to rollout.model.model_path when null.
+  checkpoint_dir: null
+  # Defaults to the per-worker rollout batch size when null.
+  max_batch_size: null
+  num_images: ${..model.openpi.num_images_in_input}
+  processor_from_pretrained: True
+  normalize_pixels: False
+  image_pad_value: 0.0
+  vision_params_dtype: float32
+  use_cuda_graph: True
+  runtime: {}
