@@ -606,20 +606,22 @@ class PhyAIWorker(MultiStepRolloutWorker):
             f"version={self.version}, loaded={len(report.loaded)}."
         )
         if getattr(self, "_functional_smoke_evidence", False):
-            suffix = "value_head.mlp.6.bias"
-            model_state = self._engine.entry.model.state_dict()
+            hf_key = "value_head.mlp.6.bias"
             matches = [
-                (name, value)
-                for name, value in model_state.items()
-                if name.endswith(suffix)
+                (name, parameter)
+                for name, parameter in self._engine.entry.model.named_parameters()
+                if any(
+                    candidate == hf_key
+                    for candidate, _shard_id in getattr(parameter, "hf_keys", ())
+                )
             ]
             if len(matches) != 1:
                 raise RuntimeError(
-                    f"Expected exactly one PhyAI parameter ending in {suffix!r}; "
+                    f"Expected exactly one PhyAI parameter for HF key {hf_key!r}; "
                     f"found {[name for name, _ in matches]}."
                 )
-            name, value = matches[0]
-            checksum = value.detach().to(dtype=torch.float64).sum().item()
+            name, parameter = matches[0]
+            checksum = parameter.detach().to(dtype=torch.float64).sum().item()
             self.log_info(
                 "Functional smoke PhyAI weight evidence: "
                 f"version={self._engine.version}, name={name}, "
