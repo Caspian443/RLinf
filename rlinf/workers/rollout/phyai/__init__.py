@@ -12,6 +12,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+from typing import Any
+
 from .phyai_worker import PhyAIWorker
 
-__all__ = ["PhyAIWorker"]
+
+def get_embodied_rollout_worker(cfg: Any):
+    """Select the embodied rollout worker; PhyAI is explicit opt-in."""
+    backend = str(cfg.rollout.get("rollout_backend", "huggingface")).lower()
+    if backend == "phyai":
+        return PhyAIWorker
+    if backend in ("huggingface", "hf"):
+        from rlinf.workers.rollout.hf.huggingface_worker import (
+            MultiStepRolloutWorker,
+        )
+
+        return MultiStepRolloutWorker
+    raise ValueError(
+        f"Unsupported embodied rollout_backend={backend!r}; "
+        "expected 'huggingface' or 'phyai'."
+    )
+
+
+PhyAIMultiStepRolloutWorker = PhyAIWorker
+
+__all__ = [
+    "PhyAIMultiStepRolloutWorker",
+    "PhyAIWorker",
+    "get_embodied_rollout_worker",
+]

@@ -65,6 +65,7 @@ class WorkerGroup(Generic[WorkerClsType]):
         self._cluster = None
 
         self._group_size = None
+        self._python_interpreter_path: str | None = None
         # The strategy to place workers on different GPUs
         self._placement_strategy = None
 
@@ -150,6 +151,7 @@ class WorkerGroup(Generic[WorkerClsType]):
         isolate_gpu: bool = True,
         catch_system_failure: Optional[bool] = None,
         disable_distributed_log: bool = False,
+        python_interpreter_path: str | None = None,
     ) -> "WorkerGroup[WorkerClsType] | WorkerClsType":
         """Create a worker group with the specified cluster and options.
 
@@ -161,6 +163,7 @@ class WorkerGroup(Generic[WorkerClsType]):
             isolate_gpu (bool): Whether a worker should only see the GPUs that it's assigned via controlling CUDA_VISIBLE_DEVICES. Defaults to True.
             catch_system_failure (Optional[bool]): Whether to catch system exit and signals in the worker process. If None, the environment variable RLINF_CATCH_FAILURE will take effect, whose default value is True. If set, then it will override the environment variable.
             disable_distributed_log (bool): Whether to disable distributed log for the worker group.
+            python_interpreter_path (str, optional): Python executable for this worker group.
 
         Returns:
             WorkerGroup: An instance of WorkerGroup with the specified configuration.
@@ -173,6 +176,7 @@ class WorkerGroup(Generic[WorkerClsType]):
         self._catch_system_failure = catch_system_failure
         self._max_concurrency = max_concurrency
         self._disable_distributed_log = disable_distributed_log
+        self._python_interpreter_path = python_interpreter_path
         if self._catch_system_failure is None:
             self._catch_system_failure = (
                 Cluster.get_sys_env_var(ClusterEnvVar.CATCH_FAILURE, "0") == "1"
@@ -283,6 +287,7 @@ class WorkerGroup(Generic[WorkerClsType]):
                 disable_distributed_log=self._disable_distributed_log,
                 cls_args=self._worker_cls_args,
                 cls_kwargs=self._worker_cls_kwargs,
+                python_interpreter_path=self._python_interpreter_path,
             )
 
             self._workers.append(

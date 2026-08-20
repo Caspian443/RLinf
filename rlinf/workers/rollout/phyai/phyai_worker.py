@@ -15,6 +15,9 @@
 """PhyAI-backed embodied rollout worker."""
 
 import gc
+import json
+from dataclasses import replace
+from pathlib import Path
 from typing import Any, Literal
 
 import torch
@@ -51,15 +54,17 @@ class PhyAIWorker(MultiStepRolloutWorker):
     are inherited from :class:`MultiStepRolloutWorker`; model construction and
     action inference are replaced with the PhyAI engine path.
 
-    The current PhyAI pi0.5 engine returns actions only. Consequently this
-    first integration supports evaluation and hot weight synchronization, but
-    deliberately rejects training rollout until PhyAI returns RLinf's
-    behavior-policy tensors.
+    Evaluation keeps the original action-only ``Engine.step`` path. Training
+    opts into ``Engine.rollout_step`` and returns the native OpenPI replay
+    contract, including denoise states, behavior logprobs, and values.
     """
 
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
 
+        self._functional_smoke_evidence = bool(
+            cfg.runner.get("functional_smoke_evidence", False)
+        )
         self._phyai_cfg = cfg.rollout.get("phyai", {})
         self._phyai_plugin = str(self._phyai_cfg.get("plugin", "pi05")).lower()
         self._engine = None
@@ -68,18 +73,15 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._weight_target = None
         self._engine_device: torch.device | None = None
         self._engine_dtype: torch.dtype | None = None
+        self._rollout_config_cls = None
+        self._normalize_pixels = False
+        self._state_dim: int | None = None
+        self._model_action_dim: int | None = None
 
         if self._phyai_plugin != "pi05":
             raise NotImplementedError(
                 "PhyAIWorker currently supports only the 'pi05' engine plugin; "
                 f"got {self._phyai_plugin!r}."
-            )
-        if not self.only_eval:
-            raise NotImplementedError(
-                "PhyAI training rollout is not implemented yet: Engine.step() "
-                "must first expose prev_logprobs, prev_values, denoise state, "
-                "and forward_inputs. "
-                "Set runner.only_eval: true for the initial integration."
             )
         if self.enable_offload:
             raise NotImplementedError(
@@ -101,7 +103,10 @@ class PhyAIWorker(MultiStepRolloutWorker):
         from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
         from phyai.models.pi05.configuration_pi05 import PI05Config
         from phyai.models.pi05.main_pi05 import PI05Args
-        from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request
+        from phyai.models.pi05.scheduler_ws1_pi05 import (
+            PI05Request,
+            PI05RolloutConfig,
+        )
         from phyai.utils import load_config
         from phyai_utils_tools.models.pi05 import PI05Processor
 
@@ -109,11 +114,35 @@ class PhyAIWorker(MultiStepRolloutWorker):
             self._phyai_cfg.get("checkpoint_dir", None) or self.model_cfg.model_path
         )
         plugin_cfg = load_config(checkpoint_dir, PI05Config)
+        if not self.only_eval:
+            model_action_horizon = self._phyai_cfg.get("model_action_horizon")
+            if model_action_horizon is None:
+                raise ValueError(
+                    "PhyAI training requires rollout.phyai.model_action_horizon; "
+                    "it is the native OpenPI model horizon, not num_action_chunks."
+                )
+            model_action_horizon = int(model_action_horizon)
+            if model_action_horizon < int(self.model_cfg.num_action_chunks):
+                raise ValueError(
+                    f"PhyAI model_action_horizon={model_action_horizon} is smaller "
+                    f"than num_action_chunks={self.model_cfg.num_action_chunks}."
+                )
+            plugin_cfg = replace(
+                plugin_cfg,
+                chunk_size=model_action_horizon,
+                num_inference_steps=int(self.model_cfg.num_steps),
+            )
+        self._model_action_dim = int(plugin_cfg.max_action_dim)
 
-        dtype = torch_dtype_from_precision(self.model_cfg.precision)
+        engine_precision = self._phyai_cfg.get(
+            "params_dtype", self.model_cfg.precision
+        )
+        if engine_precision is None:
+            engine_precision = "bf16"
+        dtype = torch_dtype_from_precision(engine_precision)
         if dtype is None:
             raise ValueError(
-                f"Unsupported PhyAI model precision: {self.model_cfg.precision!r}."
+                f"Unsupported PhyAI model precision: {engine_precision!r}."
             )
         self._engine_dtype = dtype
         self._engine_device = torch.device(self.torch_device_type)
@@ -125,9 +154,14 @@ class PhyAIWorker(MultiStepRolloutWorker):
             else runtime_cfg
         )
         runtime_values = dict(runtime_values or {})
-        runtime_values.setdefault(
-            "use_cuda_graph", self._phyai_cfg.get("use_cuda_graph", True)
+        requested_cuda_graph = bool(
+            self._phyai_cfg.get("use_cuda_graph", self.only_eval)
         )
+        if not self.only_eval and requested_cuda_graph:
+            raise ValueError(
+                "PhyAI PPO rollout requires rollout.phyai.use_cuda_graph=false."
+            )
+        runtime_values.setdefault("use_cuda_graph", requested_cuda_graph)
 
         configured_max_batch_size = self._phyai_cfg.get("max_batch_size", None)
         max_batch_size = int(
@@ -141,6 +175,11 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 self.model_cfg.get("openpi", {}).get("num_images_in_input", 3),
             )
         )
+        if not self.only_eval and num_images != 2:
+            raise ValueError(
+                "Native OpenPI pi0.5 PPO parity currently requires exactly two "
+                f"real cameras; got num_images={num_images}."
+            )
         vision_dtype = self._optional_dtype(
             self._phyai_cfg.get("vision_params_dtype", None)
         )
@@ -165,8 +204,12 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 plugin_args=PI05Args(
                     checkpoint_dir=checkpoint_dir,
                     max_batch_size=max_batch_size,
+                    config=plugin_cfg,
+                    weight_remap=self._actor_weight_name,
                     vision_params_dtype=vision_dtype,
                     inputs_image_shape=inputs_image_shape,
+                    add_value_head=not self.only_eval,
+                    require_full_hot_update=not self.only_eval,
                 ),
                 config=EngineConfig(
                     device=DeviceConfig(
@@ -177,24 +220,52 @@ class PhyAIWorker(MultiStepRolloutWorker):
             )
         )
 
+        self._normalize_pixels = bool(
+            self._phyai_cfg.get("normalize_pixels", not self.only_eval)
+        )
         processor_kwargs = {
             "image_size": plugin_cfg.vision.image_size,
             "num_channels": plugin_cfg.vision.num_channels,
             "num_images": num_images,
             "action_dim": int(self.model_cfg.action_dim),
-            "normalize_pixels": bool(self._phyai_cfg.get("normalize_pixels", False)),
+            "normalize_pixels": self._normalize_pixels,
             "image_pad_value": float(self._phyai_cfg.get("image_pad_value", 0.0)),
             "device": self._engine_device,
             "params_dtype": dtype,
         }
         try:
-            if self._phyai_cfg.get("processor_from_pretrained", True):
+            if self.only_eval and self._phyai_cfg.get(
+                "processor_from_pretrained", True
+            ):
                 processor = PI05Processor.from_pretrained(
                     checkpoint_dir, **processor_kwargs
                 )
             else:
+                processor_options: dict[str, Any] = {}
+                if not self.only_eval:
+                    state_dim = self._phyai_cfg.get("state_dim")
+                    norm_stats_path = self._phyai_cfg.get("norm_stats_path")
+                    tokenizer_name = self._phyai_cfg.get("tokenizer_name")
+                    if state_dim is None or norm_stats_path is None:
+                        raise ValueError(
+                            "PhyAI training requires rollout.phyai.state_dim and "
+                            "rollout.phyai.norm_stats_path."
+                        )
+                    if tokenizer_name is None:
+                        raise ValueError(
+                            "PhyAI training requires rollout.phyai.tokenizer_name."
+                        )
+                    self._state_dim = int(state_dim)
+                    processor_options.update(
+                        dataset_stats=self._load_dataset_stats(
+                            norm_stats_path, self._state_dim
+                        ),
+                        tokenizer_name=str(tokenizer_name),
+                        include_state_in_prompt=False,
+                    )
                 processor = PI05Processor(
                     tokenizer_max_length=plugin_cfg.tokenizer_max_length,
+                    **processor_options,
                     **processor_kwargs,
                 )
         except Exception:
@@ -205,6 +276,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._weight_target = _PhyAIWeightTarget(engine)
         self._processor = processor
         self._request_cls = PI05Request
+        self._rollout_config_cls = PI05RolloutConfig
 
     @staticmethod
     def _optional_dtype(value: Any) -> torch.dtype | None:
@@ -221,6 +293,48 @@ class PhyAIWorker(MultiStepRolloutWorker):
         if dtype is None:
             raise ValueError(f"Unsupported PhyAI vision_params_dtype: {value!r}.")
         return dtype
+
+    @staticmethod
+    def _actor_weight_name(name: str) -> str:
+        """Map the native wrapper prefix to PhyAI HF parameter names."""
+        return name[len("model.") :] if name.startswith("model.") else name
+
+    @staticmethod
+    def _load_dataset_stats(
+        path: str | Path, state_dim: int
+    ) -> dict[str, dict[str, Any]]:
+        """Load OpenPI stats and trim state stats before native-style padding."""
+        with Path(path).open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+        stats = payload.get("norm_stats", payload)
+        if "state" not in stats or "actions" not in stats:
+            raise ValueError(
+                f"OpenPI norm stats at {path} must contain state and actions."
+            )
+
+        state_stats: dict[str, Any] = {}
+        for key, values in stats["state"].items():
+            if len(values) < state_dim:
+                raise ValueError(
+                    f"state stat {key!r} has {len(values)} values, "
+                    f"fewer than state_dim={state_dim}."
+                )
+            state_stats[key] = values[:state_dim]
+        return {
+            "observation.state": state_stats,
+            "action": stats["actions"],
+        }
+
+    @staticmethod
+    def _pad_last_dim(tensor: torch.Tensor, size: int) -> torch.Tensor:
+        if tensor.shape[-1] > size:
+            raise ValueError(
+                f"Cannot pad last dimension {tensor.shape[-1]} down to {size}."
+            )
+        if tensor.shape[-1] == size:
+            return tensor.contiguous()
+        return torch.nn.functional.pad(tensor, (0, size - tensor.shape[-1]))
+
 
     @staticmethod
     def _camera_batches(value: Any, name: str) -> list[torch.Tensor]:
@@ -248,7 +362,12 @@ class PhyAIWorker(MultiStepRolloutWorker):
             normalized.append(camera)
         return normalized
 
-    def _build_request(self, env_obs: dict[str, Any]):
+    def _build_request(
+        self,
+        env_obs: dict[str, Any],
+        *,
+        return_processed: bool = False,
+    ):
         if self._processor is None or self._request_cls is None:
             raise RuntimeError("init_worker() must be called before PhyAI inference.")
         if self._engine_device is None or self._engine_dtype is None:
@@ -259,6 +378,11 @@ class PhyAIWorker(MultiStepRolloutWorker):
         images.extend(
             self._camera_batches(env_obs.get("extra_view_images"), "extra_view_images")
         )
+        if self._normalize_pixels:
+            images = [
+                image.float().div(255.0) if image.dtype == torch.uint8 else image
+                for image in images
+            ]
         if not images:
             raise ValueError("PhyAI inference requires env_obs['main_images'].")
         processed = self._processor.preprocess(
@@ -268,29 +392,93 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 "state": env_obs["states"],
             }
         )
-        return self._request_cls(
+        request = self._request_cls(
             pixel_values=processed.pixel_values.to(
                 device=self._engine_device, dtype=self._engine_dtype
             ),
             input_ids=processed.input_ids.to(device=self._engine_device),
             lang_lens=processed.lang_lens.to(device=self._engine_device),
         )
+        if return_processed:
+            return request, processed
+        return request
+
+    def _build_training_forward_inputs(
+        self,
+        env_obs: dict[str, Any],
+        processed: Any,
+        rollout_result: Any,
+        actions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Build the legacy native OpenPI replay contract.
+
+        The Actor intentionally receives raw observations and runs its existing
+        OpenPI transforms again. Only prompt tokens are reused from PhyAI so the
+        behavior and replay policies see exactly the same task tokenization.
+        """
+        batch_size = int(rollout_result.actions.shape[0])
+        token_ids = processed.input_ids.to(device=self._engine_device)
+        token_mask = (
+            torch.arange(token_ids.shape[1], device=self._engine_device)[None, :]
+            < processed.lang_lens.to(device=self._engine_device)[:, None]
+        )
+
+        states = env_obs["states"]
+        state_indices = self.model_cfg.get("openpi", {}).get("state_indices", None)
+        if state_indices is not None:
+            states = states[..., list(state_indices)]
+
+        forward_inputs = {
+            "chains": rollout_result.chains,
+            "denoise_inds": rollout_result.denoise_inds,
+            "tokenized_prompt": token_ids,
+            "tokenized_prompt_mask": token_mask,
+            "action": actions.to(device=self._engine_device).reshape(batch_size, -1),
+            "model_action": rollout_result.actions.reshape(batch_size, -1),
+            "observation/image": env_obs["main_images"],
+            "observation/state": states,
+        }
+        if env_obs.get("wrist_images") is not None:
+            forward_inputs["observation/wrist_image"] = env_obs["wrist_images"]
+        if env_obs.get("extra_view_images") is not None:
+            forward_inputs["observation/extra_view_image"] = env_obs[
+                "extra_view_images"
+            ]
+        return {
+            key: value.contiguous() if torch.is_tensor(value) else value
+            for key, value in forward_inputs.items()
+        }
 
     @Worker.timer("predict")
     def predict(
         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "eval"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        """Convert RLinf observations, run ``Engine.step``, and return actions."""
-        if mode != "eval":
-            raise NotImplementedError(
-                "PhyAI Engine.step() currently returns actions only and cannot "
-                "satisfy RLinf's training rollout result contract."
-            )
+        """Run inference or collect the real behavior-policy PPO state."""
+        if mode not in ("train", "eval"):
+            raise ValueError(f"Unsupported PhyAI rollout mode: {mode!r}.")
+        if mode == "train" and self.only_eval:
+            raise RuntimeError("An evaluation-only PhyAI worker cannot run train mode.")
         if self._engine is None or self._processor is None:
             raise RuntimeError("init_worker() must be called before PhyAI inference.")
 
-        request = self._build_request(env_obs)
-        model_actions = self._engine.step(request)
+        request, processed = self._build_request(env_obs, return_processed=True)
+        rollout_result = None
+        if mode == "train":
+            if self._rollout_config_cls is None:
+                raise RuntimeError("PhyAI rollout config is not initialized.")
+            openpi_cfg = self.model_cfg.get("openpi", {})
+            rollout_config = self._rollout_config_cls(
+                action_chunk=int(self.model_cfg.num_action_chunks),
+                action_dim=int(self.model_cfg.action_dim),
+                noise_method=str(openpi_cfg.get("noise_method", "flow_sde")),
+                noise_level=float(openpi_cfg.get("noise_level", 0.5)),
+            )
+            rollout_result = self._engine.rollout_step(
+                request, rollout_config=rollout_config
+            )
+            model_actions = rollout_result.actions
+        else:
+            model_actions = self._engine.step(request)
         actions = self._processor.postprocess(model_actions)
         if not isinstance(actions, torch.Tensor):
             actions = torch.as_tensor(actions)
@@ -303,23 +491,49 @@ class PhyAIWorker(MultiStepRolloutWorker):
         actions = actions[:, :requested_chunks]
         actions = actions.to(dtype=torch.float32).contiguous()
 
+        if getattr(self, "_functional_smoke_evidence", False):
+            self.log_info(
+                "Functional smoke PhyAI inference evidence: "
+                f"version={self._engine.version}, shape={tuple(actions.shape)}, "
+                f"finite={bool(torch.isfinite(actions).all())}, "
+                f"engine_id={id(self._engine)}, entry_id={id(self._engine.entry)}, "
+                f"model_id={id(self._engine.entry.model)}."
+            )
+
         batch_size = actions.shape[0]
-        result = {
-            "prev_logprobs": None,
-            "prev_values": None,
-            "forward_inputs": {
-                "action": actions.reshape(batch_size, -1),
-                "model_action": model_actions.reshape(batch_size, -1),
-            },
-            "expert_label_flag": False,
-        }
+        if rollout_result is None:
+            result = {
+                "prev_logprobs": None,
+                "prev_values": None,
+                "forward_inputs": {
+                    "action": actions.reshape(batch_size, -1),
+                    "model_action": model_actions.reshape(batch_size, -1),
+                },
+                "expert_label_flag": False,
+            }
+        else:
+            result = {
+                "prev_logprobs": rollout_result.prev_logprobs,
+                "prev_values": rollout_result.prev_values,
+                "forward_inputs": self._build_training_forward_inputs(
+                    env_obs, processed, rollout_result, actions
+                ),
+                "expert_label_flag": False,
+            }
         return actions, result
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
     ) -> torch.Tensor | None:
-        """PhyAI pi0.5 currently has no value head."""
-        return None
+        """Compute the final-observation value for native GAE."""
+        if final_obs is None or self.only_eval:
+            return None
+        with torch.no_grad():
+            _, result = self.predict(final_obs, mode="train")
+        values = result["prev_values"]
+        if values is None:
+            raise RuntimeError("PhyAI training rollout did not return bootstrap values.")
+        return values[:, :1].cpu().contiguous()
 
     @Worker.timer("sync_model_from_actor")
     async def sync_model_from_actor(self) -> None:
@@ -377,7 +591,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 self._weight_target,
                 recv_func,
             )
-            report = self._engine.finish_weight_update()
+            report = self._engine.finish_weight_update(version=applied_version)
         except Exception:
             self._engine.abort_weight_update()
             raise
@@ -391,6 +605,28 @@ class PhyAIWorker(MultiStepRolloutWorker):
             "PhyAI hot weight update applied: "
             f"version={self.version}, loaded={len(report.loaded)}."
         )
+        if getattr(self, "_functional_smoke_evidence", False):
+            suffix = "value_head.mlp.6.bias"
+            model_state = self._engine.entry.model.state_dict()
+            matches = [
+                (name, value)
+                for name, value in model_state.items()
+                if name.endswith(suffix)
+            ]
+            if len(matches) != 1:
+                raise RuntimeError(
+                    f"Expected exactly one PhyAI parameter ending in {suffix!r}; "
+                    f"found {[name for name, _ in matches]}."
+                )
+            name, value = matches[0]
+            checksum = value.detach().to(dtype=torch.float64).sum().item()
+            self.log_info(
+                "Functional smoke PhyAI weight evidence: "
+                f"version={self._engine.version}, name={name}, "
+                f"checksum={checksum:.17g}, engine_id={id(self._engine)}, "
+                f"entry_id={id(self._engine.entry)}, "
+                f"model_id={id(self._engine.entry.model)}."
+            )
         gc.collect()
         self.torch_platform.empty_cache()
 

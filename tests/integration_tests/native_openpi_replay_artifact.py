@@ -7,6 +7,7 @@ the PhyAI artifact generator, then replay after it.
 from __future__ import annotations
 
 import argparse
+import types
 import json
 from pathlib import Path
 
@@ -108,14 +109,30 @@ def replay(args: argparse.Namespace) -> None:
         key: value.to("cuda") if key in device_keys else value
         for key, value in forward_inputs.items()
     }
+    native_velocities = []
+    original_sample_mean_var_val = model.sample_mean_var_val
+
+    def capture_velocity(_self, *call_args, **call_kwargs):
+        result = original_sample_mean_var_val(*call_args, **call_kwargs)
+        native_velocities.append(result[3].detach().float())
+        return result
+
+    model.sample_mean_var_val = types.MethodType(capture_velocity, model)
+
     with torch.no_grad():
         output = model.default_forward(forward_inputs, compute_values=True)
+    native_velocity = native_velocities[0]
+    phyai_velocity = artifact["phyai_velocity"].to("cuda").float()
+    velocity_delta = native_velocity - phyai_velocity
 
     old_logprob = artifact["prev_logprobs"].to("cuda").float()
     new_logprob = output["logprobs"].float()
     delta = new_logprob - old_logprob
     ratio = torch.exp(delta)
     values = output["values"].float()
+    chunk_delta = delta.flatten(1).sum(dim=1)
+    chunk_ratio = torch.exp(chunk_delta)
+    old_values = artifact["prev_values"].to("cuda").flatten().float()
     evidence = {
         "old_shape": list(old_logprob.shape),
         "new_shape": list(new_logprob.shape),
@@ -128,6 +145,18 @@ def replay(args: argparse.Namespace) -> None:
         "ratio_mean": float(ratio.mean()),
         "ratio_min": float(ratio.min()),
         "ratio_max": float(ratio.max()),
+        "chunk_logprob_delta": [float(value) for value in chunk_delta],
+        "chunk_ratio": [float(value) for value in chunk_ratio],
+        "chunk_ratio_mean": float(chunk_ratio.mean()),
+        "old_values_finite": bool(torch.isfinite(old_values).all()),
+        "value_mean_delta": float((values - old_values).mean()),
+        "value_max_abs_delta": float((values - old_values).abs().max()),
+        "velocity_shape": list(native_velocity.shape),
+        "velocity_native_finite": bool(torch.isfinite(native_velocity).all()),
+        "velocity_phyai_finite": bool(torch.isfinite(phyai_velocity).all()),
+        "velocity_mean_abs_delta": float(velocity_delta.abs().mean()),
+        "velocity_max_abs_delta": float(velocity_delta.abs().max()),
+        "velocity_native_abs_mean": float(native_velocity.abs().mean()),
     }
     print(json.dumps(evidence, indent=2, sort_keys=True))
     if not all(

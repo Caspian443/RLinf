@@ -16,8 +16,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from omegaconf import OmegaConf
 
 from rlinf.hybrid_engines.weight_syncer.bucket_syncer import BucketWeightSyncer
+from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
+from rlinf.workers.rollout.phyai import get_embodied_rollout_worker
 from rlinf.workers.rollout.phyai.phyai_worker import (
     PhyAIWorker,
     _PhyAIWeightTarget,
@@ -34,8 +37,8 @@ class _FakeEngine:
     def update_weights(self, state_dict) -> None:
         self.events.append(("update", state_dict))
 
-    def finish_weight_update(self):
-        self.events.append("finish")
+    def finish_weight_update(self, version=None):
+        self.events.append(("finish", version))
         return SimpleNamespace(loaded=["model.weight"])
 
     def abort_weight_update(self) -> None:
@@ -66,6 +69,9 @@ class _FakeBucketWeightSyncer(BucketWeightSyncer):
 def _make_worker(*, fail: bool = False):
     worker = object.__new__(PhyAIWorker)
     engine = _FakeEngine()
+    worker._accelerator_type = "cpu"
+    worker._timer_metrics = {}
+    worker._rank = 0
     worker._engine = engine
     worker._weight_target = _PhyAIWeightTarget(engine)
     worker.weight_syncer = _FakeBucketWeightSyncer(fail=fail)
@@ -92,7 +98,7 @@ async def test_sync_model_from_actor_streams_buckets_into_engine():
 
     assert engine.events[0] == "begin"
     assert engine.events[1][0] == "update"
-    assert engine.events[2] == "finish"
+    assert engine.events[2] == ("finish", 7)
     assert worker.version == 7
     assert worker.finished_episodes == 56
 
@@ -105,3 +111,52 @@ async def test_sync_model_from_actor_aborts_failed_update():
         await PhyAIWorker.sync_model_from_actor.__wrapped__(worker)
 
     assert engine.events[-1] == "abort"
+
+
+def test_embodied_rollout_backend_is_opt_in():
+    default_cfg = OmegaConf.create({"rollout": {}})
+    native_cfg = OmegaConf.create({"rollout": {"rollout_backend": "huggingface"}})
+    phyai_cfg = OmegaConf.create({"rollout": {"rollout_backend": "phyai"}})
+
+    assert get_embodied_rollout_worker(default_cfg) is MultiStepRolloutWorker
+    assert get_embodied_rollout_worker(native_cfg) is MultiStepRolloutWorker
+    assert get_embodied_rollout_worker(phyai_cfg) is PhyAIWorker
+
+
+def test_training_forward_inputs_match_native_contract():
+    worker = object.__new__(PhyAIWorker)
+    worker._engine_device = torch.device("cpu")
+    worker.model_cfg = OmegaConf.create({"openpi": {}})
+    env_obs = {
+        "main_images": torch.randint(0, 256, (2, 3, 256, 256), dtype=torch.uint8),
+        "wrist_images": torch.randint(0, 256, (2, 3, 128, 128), dtype=torch.uint8),
+        "extra_view_images": None,
+        "states": torch.randn(2, 8),
+    }
+    processed = SimpleNamespace(
+        state=torch.randn(2, 8),
+        input_ids=torch.arange(400).view(2, 200),
+        lang_lens=torch.tensor([7, 8]),
+        pixel_values=torch.randn(2, 2, 3, 224, 224),
+    )
+    rollout = SimpleNamespace(
+        actions=torch.randn(2, 10, 32),
+        chains=torch.randn(2, 4, 10, 32),
+        denoise_inds=torch.ones(2, 3, dtype=torch.long),
+    )
+    actions = torch.randn(2, 5, 7)
+
+    inputs = worker._build_training_forward_inputs(
+        env_obs, processed, rollout, actions
+    )
+
+    assert inputs["chains"].shape == (2, 4, 10, 32)
+    assert inputs["denoise_inds"].shape == (2, 3)
+    assert inputs["tokenized_prompt_mask"].sum(dim=1).tolist() == [7, 8]
+    assert inputs["observation/image"] is env_obs["main_images"]
+    assert inputs["observation/wrist_image"] is env_obs["wrist_images"]
+    assert inputs["observation/state"] is env_obs["states"]
+    assert "obs_state" not in inputs
+    assert not any(key.startswith("obs_image__") for key in inputs)
+    assert inputs["action"].shape == (2, 35)
+    assert inputs["model_action"].shape == (2, 320)

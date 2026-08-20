@@ -4,6 +4,7 @@ defaults:
   - model/pi0_5@actor.model
   - hybrid_engines/fsdp@actor.fsdp_config
   - weight_syncer/bucket_syncer@weight_syncer
+  - _self_
   - override hydra/job_logging: stdout
 
 hydra:
@@ -17,7 +18,13 @@ cluster:
     actor: 0
     rollout,env: 1
 
+weight_syncer:
+  bucket:
+    bucket_size: 67108864
+    bucket_device: cpu
+
 runner:
+  functional_smoke_evidence: true
   task_type: embodied
   logger:
     log_path: ${oc.env:RLINF_SMOKE_LOG_DIR,/tmp/rlinf-phyai-smoke}

@@ -11,6 +11,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import torch
+from safetensors import safe_open
 
 from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
@@ -39,8 +40,10 @@ def _dataset_stats(raw_stats: dict, state_dim: int) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--actor-checkpoint", required=True, type=Path)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--native-preprocess", required=True, type=Path)
+    parser.add_argument("--norm-stats", required=True, type=Path)
     parser.add_argument("--value-head", required=True, type=Path)
     parser.add_argument("--trajectory", required=True, type=Path)
     parser.add_argument("--target-keys", required=True, type=Path)
@@ -52,13 +55,14 @@ def main() -> None:
         args.native_preprocess, map_location="cpu", weights_only=False
     )
     env = source["env"]
-    raw_stats = source["stats"]
+    stats_payload = json.loads(args.norm_stats.read_text())
+    raw_stats = stats_payload.get("norm_stats", stats_payload)
     batch_size = int(env["states"].shape[0])
     state_dim = int(env["states"].shape[-1])
 
     plugin_cfg = replace(
         load_config(args.checkpoint, PI05Config),
-        chunk_size=5,
+        chunk_size=10,
         num_inference_steps=3,
     )
     engine = Engine(
@@ -68,10 +72,9 @@ def main() -> None:
                 checkpoint_dir=args.checkpoint,
                 config=plugin_cfg,
                 max_batch_size=batch_size,
-                vision_params_dtype=torch.float32,
                 inputs_image_shape=[[224, 224, 3], [224, 224, 3]],
                 add_value_head=True,
-                require_full_hot_update=False,
+                require_full_hot_update=True,
             ),
             config=EngineConfig(
                 device=DeviceConfig(target="cuda", params_dtype=torch.bfloat16),
@@ -83,11 +86,26 @@ def main() -> None:
         value_head = torch.load(
             args.value_head, map_location="cpu", weights_only=True
         )
+        checkpoint_files = (
+            [args.actor_checkpoint]
+            if args.actor_checkpoint.is_file()
+            else sorted(args.actor_checkpoint.glob("*.safetensors"))
+        )
+        if not checkpoint_files:
+            raise FileNotFoundError(
+                f"No Actor safetensors found at {args.actor_checkpoint}."
+            )
+
         engine.begin_weight_update()
+        for checkpoint_file in checkpoint_files:
+            with safe_open(str(checkpoint_file), framework="pt", device="cpu") as src:
+                engine.update_weights(
+                    (name, src.get_tensor(name)) for name in src.keys()
+                )
         engine.update_weights(value_head)
-        report = engine.finish_weight_update(version=0)
-        if sorted(report.loaded) != sorted(value_head):
-            raise RuntimeError(f"Value-head hot update mismatch: {report.summary()}")
+        report = engine.finish_weight_update(version=1)
+        if report.missing or report.unexpected:
+            raise RuntimeError(f"Strict Actor update mismatch: {report.summary()}")
 
         target_session = WeightLoadSession(engine.entry.model)
         target_metadata = {
@@ -118,7 +136,7 @@ def main() -> None:
                 "state": env["states"],
             }
         )
-        noise = torch.randn(batch_size, 5, 32, dtype=torch.float32)
+        noise = torch.randn(batch_size, 10, 32, dtype=torch.float32)
         request = PI05Request(
             pixel_values=processed.pixel_values,
             input_ids=processed.input_ids,
@@ -135,6 +153,10 @@ def main() -> None:
                 denoise_index=1,
             ),
         )
+        scheduler = engine.entry.scheduler
+        phyai_velocity = scheduler.expert_runner.forward_velocity(
+            rollout.chains[:, 1].to("cuda"), 1
+        )[:batch_size].float()
         actions = processor.postprocess(rollout.actions).float().contiguous()
         token_mask = (
             torch.arange(processed.input_ids.shape[1], device="cuda")[None, :]
@@ -154,6 +176,7 @@ def main() -> None:
         artifact = {
             "forward_inputs": forward_inputs,
             "prev_logprobs": rollout.prev_logprobs.detach().cpu(),
+            "phyai_velocity": phyai_velocity.detach().cpu(),
             "prev_values": rollout.prev_values.detach().cpu(),
             "actions": actions,
             "engine_version": engine.version,
@@ -164,7 +187,9 @@ def main() -> None:
             "python": __import__("sys").executable,
             "transformers": __import__("transformers").__version__,
             "engine_version": engine.version,
-            "loaded_value_head": len(report.loaded),
+            "loaded_actor_weights": len(report.loaded),
+            "missing_actor_weights": len(report.missing),
+            "unexpected_actor_weights": len(report.unexpected),
             "target_key_count": len(target_metadata),
             "actions_shape": list(actions.shape),
             "chains_shape": list(rollout.chains.shape),
@@ -181,4 +206,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-PATCH
