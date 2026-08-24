@@ -128,29 +128,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
     def get_rollout_state_dict(self) -> dict:
         return self.get_model_state_dict(cpu_offload=False, full_state_dict=False)
 
-    @staticmethod
-    def _smoke_weight_evidence(state_dict: dict) -> tuple[str, float, float]:
-        """Return a stable, low-cost checksum for opt-in functional smoke logs."""
-        suffix = "value_head.mlp.6.bias"
-        matches = [
-            (name, value)
-            for name, value in state_dict.items()
-            if name.endswith(suffix)
-        ]
-        if len(matches) != 1:
-            raise RuntimeError(
-                f"Expected exactly one Actor parameter ending in {suffix!r}; "
-                f"found {[name for name, _ in matches]}."
-            )
-        name, value = matches[0]
-        tensor = value.to_local() if hasattr(value, "to_local") else value
-        tensor = tensor.detach()
-        checksum = tensor.to(dtype=torch.float64).sum().item()
-        bf16_checksum = (
-            tensor.to(dtype=torch.bfloat16).to(dtype=torch.float64).sum().item()
-        )
-        return name, checksum, bf16_checksum
-
     @Worker.timer("actor/sync_model_to_rollout")
     async def sync_model_to_rollout(self) -> None:
         if self.enable_offload:
@@ -161,14 +138,6 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
                 self.load_param_and_grad(self.device, False)
 
         state_dict = self.get_rollout_state_dict()
-
-        if self.cfg.runner.get("functional_smoke_evidence", False):
-            name, checksum, bf16_checksum = self._smoke_weight_evidence(state_dict)
-            self.log_info(
-                "Functional smoke Actor weight evidence: "
-                f"version={self.version}, name={name}, checksum={checksum:.17g}, "
-                f"bf16_checksum={bf16_checksum:.17g}."
-            )
 
         async def send_func(data):
             if not self._is_weight_sender:

@@ -146,9 +146,7 @@ def test_training_forward_inputs_match_native_contract():
     )
     actions = torch.randn(2, 5, 7)
 
-    inputs = worker._build_training_forward_inputs(
-        env_obs, processed, rollout, actions
-    )
+    inputs = worker._build_training_forward_inputs(env_obs, processed, rollout, actions)
 
     assert inputs["chains"].shape == (2, 4, 10, 32)
     assert inputs["denoise_inds"].shape == (2, 3)

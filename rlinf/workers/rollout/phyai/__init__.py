@@ -14,13 +14,13 @@
 
 from typing import Any
 
-from .phyai_worker import PhyAIWorker
-
 
 def get_embodied_rollout_worker(cfg: Any):
     """Select the embodied rollout worker; PhyAI is explicit opt-in."""
     backend = str(cfg.rollout.get("rollout_backend", "huggingface")).lower()
     if backend == "phyai":
+        from .phyai_worker import PhyAIWorker
+
         return PhyAIWorker
     if backend in ("huggingface", "hf"):
         from rlinf.workers.rollout.hf.huggingface_worker import (
@@ -34,7 +34,13 @@ def get_embodied_rollout_worker(cfg: Any):
     )
 
 
-PhyAIMultiStepRolloutWorker = PhyAIWorker
+def __getattr__(name: str):
+    if name in {"PhyAIWorker", "PhyAIMultiStepRolloutWorker"}:
+        from .phyai_worker import PhyAIWorker
+
+        return PhyAIWorker
+    raise AttributeError(name)
+
 
 __all__ = [
     "PhyAIMultiStepRolloutWorker",

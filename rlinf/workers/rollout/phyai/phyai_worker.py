@@ -22,8 +22,16 @@ from typing import Any, Literal
 
 import torch
 from omegaconf import DictConfig, OmegaConf
+from phyai.engine import Engine, EngineArgs
+from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.models.pi05.configuration_pi05 import PI05Config
+from phyai.models.pi05.main_pi05 import PI05Args
+from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request, PI05RolloutConfig
+from phyai.utils import load_config
+from phyai_utils_tools.models.pi05 import PI05Processor
 
 from rlinf.config import torch_dtype_from_precision
+from rlinf.hybrid_engines.weight_syncer.bucket_syncer import BucketWeightSyncer
 from rlinf.scheduler import Worker
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
@@ -31,7 +39,7 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 class _PhyAIWeightTarget(torch.nn.Module):
     """Adapt bucket syncer's ``load_state_dict`` calls to a PhyAI Engine."""
 
-    def __init__(self, engine: Any) -> None:
+    def __init__(self, engine: Engine) -> None:
         super().__init__()
         self.engine = engine
 
@@ -62,21 +70,14 @@ class PhyAIWorker(MultiStepRolloutWorker):
     def __init__(self, cfg: DictConfig):
         super().__init__(cfg)
 
-        self._functional_smoke_evidence = bool(
-            cfg.runner.get("functional_smoke_evidence", False)
-        )
         self._phyai_cfg = cfg.rollout.get("phyai", {})
         self._phyai_plugin = str(self._phyai_cfg.get("plugin", "pi05")).lower()
         self._engine = None
         self._processor = None
-        self._request_cls = None
         self._weight_target = None
         self._engine_device: torch.device | None = None
         self._engine_dtype: torch.dtype | None = None
-        self._rollout_config_cls = None
         self._normalize_pixels = False
-        self._state_dim: int | None = None
-        self._model_action_dim: int | None = None
 
         if self._phyai_plugin != "pi05":
             raise NotImplementedError(
@@ -98,17 +99,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
         """Construct one PhyAI engine and its cached pi0.5 processor."""
         if self._engine is not None:
             raise RuntimeError("PhyAI engine is already initialized.")
-
-        from phyai.engine import Engine, EngineArgs
-        from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
-        from phyai.models.pi05.configuration_pi05 import PI05Config
-        from phyai.models.pi05.main_pi05 import PI05Args
-        from phyai.models.pi05.scheduler_ws1_pi05 import (
-            PI05Request,
-            PI05RolloutConfig,
-        )
-        from phyai.utils import load_config
-        from phyai_utils_tools.models.pi05 import PI05Processor
 
         checkpoint_dir = str(
             self._phyai_cfg.get("checkpoint_dir", None) or self.model_cfg.model_path
@@ -132,11 +122,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 chunk_size=model_action_horizon,
                 num_inference_steps=int(self.model_cfg.num_steps),
             )
-        self._model_action_dim = int(plugin_cfg.max_action_dim)
-
-        engine_precision = self._phyai_cfg.get(
-            "params_dtype", self.model_cfg.precision
-        )
+        engine_precision = self._phyai_cfg.get("params_dtype", self.model_cfg.precision)
         if engine_precision is None:
             engine_precision = "bf16"
         dtype = torch_dtype_from_precision(engine_precision)
@@ -255,10 +241,10 @@ class PhyAIWorker(MultiStepRolloutWorker):
                         raise ValueError(
                             "PhyAI training requires rollout.phyai.tokenizer_name."
                         )
-                    self._state_dim = int(state_dim)
+                    state_dim = int(state_dim)
                     processor_options.update(
                         dataset_stats=self._load_dataset_stats(
-                            norm_stats_path, self._state_dim
+                            norm_stats_path, state_dim
                         ),
                         tokenizer_name=str(tokenizer_name),
                         include_state_in_prompt=False,
@@ -275,8 +261,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._engine = engine
         self._weight_target = _PhyAIWeightTarget(engine)
         self._processor = processor
-        self._request_cls = PI05Request
-        self._rollout_config_cls = PI05RolloutConfig
 
     @staticmethod
     def _optional_dtype(value: Any) -> torch.dtype | None:
@@ -326,17 +310,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
         }
 
     @staticmethod
-    def _pad_last_dim(tensor: torch.Tensor, size: int) -> torch.Tensor:
-        if tensor.shape[-1] > size:
-            raise ValueError(
-                f"Cannot pad last dimension {tensor.shape[-1]} down to {size}."
-            )
-        if tensor.shape[-1] == size:
-            return tensor.contiguous()
-        return torch.nn.functional.pad(tensor, (0, size - tensor.shape[-1]))
-
-
-    @staticmethod
     def _camera_batches(value: Any, name: str) -> list[torch.Tensor]:
         """Normalize one RLinf camera field to a list of BCHW tensors."""
         if value is None:
@@ -362,13 +335,8 @@ class PhyAIWorker(MultiStepRolloutWorker):
             normalized.append(camera)
         return normalized
 
-    def _build_request(
-        self,
-        env_obs: dict[str, Any],
-        *,
-        return_processed: bool = False,
-    ):
-        if self._processor is None or self._request_cls is None:
+    def _build_request(self, env_obs: dict[str, Any]) -> tuple[PI05Request, Any]:
+        if self._processor is None:
             raise RuntimeError("init_worker() must be called before PhyAI inference.")
         if self._engine_device is None or self._engine_dtype is None:
             raise RuntimeError("PhyAI engine device and dtype are not initialized.")
@@ -389,19 +357,17 @@ class PhyAIWorker(MultiStepRolloutWorker):
             {
                 "images": images,
                 "task": env_obs["task_descriptions"],
-                "state": env_obs["states"],
+                "state": env_obs["states"].to(device=self._engine_device),
             }
         )
-        request = self._request_cls(
+        request = PI05Request(
             pixel_values=processed.pixel_values.to(
                 device=self._engine_device, dtype=self._engine_dtype
             ),
             input_ids=processed.input_ids.to(device=self._engine_device),
             lang_lens=processed.lang_lens.to(device=self._engine_device),
         )
-        if return_processed:
-            return request, processed
-        return request
+        return request, processed
 
     def _build_training_forward_inputs(
         self,
@@ -461,13 +427,11 @@ class PhyAIWorker(MultiStepRolloutWorker):
         if self._engine is None or self._processor is None:
             raise RuntimeError("init_worker() must be called before PhyAI inference.")
 
-        request, processed = self._build_request(env_obs, return_processed=True)
+        request, processed = self._build_request(env_obs)
         rollout_result = None
         if mode == "train":
-            if self._rollout_config_cls is None:
-                raise RuntimeError("PhyAI rollout config is not initialized.")
             openpi_cfg = self.model_cfg.get("openpi", {})
-            rollout_config = self._rollout_config_cls(
+            rollout_config = PI05RolloutConfig(
                 action_chunk=int(self.model_cfg.num_action_chunks),
                 action_dim=int(self.model_cfg.action_dim),
                 noise_method=str(openpi_cfg.get("noise_method", "flow_sde")),
@@ -490,15 +454,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
             )
         actions = actions[:, :requested_chunks]
         actions = actions.to(dtype=torch.float32).contiguous()
-
-        if getattr(self, "_functional_smoke_evidence", False):
-            self.log_info(
-                "Functional smoke PhyAI inference evidence: "
-                f"version={self._engine.version}, shape={tuple(actions.shape)}, "
-                f"finite={bool(torch.isfinite(actions).all())}, "
-                f"engine_id={id(self._engine)}, entry_id={id(self._engine.entry)}, "
-                f"model_id={id(self._engine.entry.model)}."
-            )
 
         batch_size = actions.shape[0]
         if rollout_result is None:
@@ -532,16 +487,14 @@ class PhyAIWorker(MultiStepRolloutWorker):
             _, result = self.predict(final_obs, mode="train")
         values = result["prev_values"]
         if values is None:
-            raise RuntimeError("PhyAI training rollout did not return bootstrap values.")
+            raise RuntimeError(
+                "PhyAI training rollout did not return bootstrap values."
+            )
         return values[:, :1].cpu().contiguous()
 
     @Worker.timer("sync_model_from_actor")
     async def sync_model_from_actor(self) -> None:
         """Receive actor buckets and hot-update the in-process PhyAI engine."""
-        from rlinf.hybrid_engines.weight_syncer.bucket_syncer import (
-            BucketWeightSyncer,
-        )
-
         if self._engine is None or self._weight_target is None:
             raise RuntimeError("init_worker() must be called before weight sync.")
         if self.weight_syncer is None:
@@ -605,30 +558,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
             "PhyAI hot weight update applied: "
             f"version={self.version}, loaded={len(report.loaded)}."
         )
-        if getattr(self, "_functional_smoke_evidence", False):
-            hf_key = "value_head.mlp.6.bias"
-            matches = [
-                (name, parameter)
-                for name, parameter in self._engine.entry.model.named_parameters()
-                if any(
-                    candidate == hf_key
-                    for candidate, _shard_id in getattr(parameter, "hf_keys", ())
-                )
-            ]
-            if len(matches) != 1:
-                raise RuntimeError(
-                    f"Expected exactly one PhyAI parameter for HF key {hf_key!r}; "
-                    f"found {[name for name, _ in matches]}."
-                )
-            name, parameter = matches[0]
-            checksum = parameter.detach().to(dtype=torch.float64).sum().item()
-            self.log_info(
-                "Functional smoke PhyAI weight evidence: "
-                f"version={self._engine.version}, name={name}, "
-                f"checksum={checksum:.17g}, engine_id={id(self._engine)}, "
-                f"entry_id={id(self._engine.entry)}, "
-                f"model_id={id(self._engine.entry.model)}."
-            )
         gc.collect()
         self.torch_platform.empty_cache()
 
@@ -645,4 +574,3 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._engine = None
         self._weight_target = None
         self._processor = None
-        self._request_cls = None
