@@ -11,8 +11,8 @@ precision: bf16
 is_lora: False
 lora_rank: 32
 
-# Action and chunk settings (BEHAVIOR pi05). `num_action_chunks` is the Pi0
-# action_horizon.
+# Number of actions executed by the environment per policy call. The underlying
+# model horizon can be configured independently below.
 num_action_chunks: 32
 action_dim: 23
 use_proprio: True
@@ -24,8 +24,8 @@ num_steps: 5
 # No value head in the eval-only model.
 add_value_head: False
 
-# openpi_rlinf model-shape parameters. get_model builds Pi0Config from
-# num_action_chunks (action_horizon) + the openpi.* shape fields; no config.json
+# openpi_rlinf model-shape parameters. get_model builds Pi0Config from the
+# openpi.* shape fields; no config.json
 # is read. Norm stats + the PaliGemma tokenizer are resolved by the shared openpi
 # transform pipeline (checkpoint-relative for eval; the tokenizer from openpi's
 # cache), so no assets_dir/asset_id/paligemma_tokenizer are needed here.
@@ -40,6 +40,9 @@ openpi:
   # (rlinf.models.embodiment.openpi.dataconfig.get_openpi_config). Also the env
   # selector for eval repack and the SFT dataloader registry.
   config_name: "pi05_behavior"
+  # Defaults to the executed chunk for compatibility. Override this when the
+  # checkpoint predicts a longer horizon than the environment executes.
+  model_action_horizon: ${..num_action_chunks}
   num_images_in_input: 3
   action_chunk: ${..num_action_chunks}
   num_steps: ${..num_steps}

@@ -29,6 +29,21 @@ from rlinf.utils.logging import get_logger
 logger = get_logger()
 
 
+def _resolve_model_action_horizon(cfg: Any, model_cfg: Any) -> int:
+    """Resolve the model horizon independently from the executed action chunk."""
+    action_chunk = int(cfg.num_action_chunks)
+    configured_horizon = model_cfg.get("model_action_horizon")
+    model_action_horizon = int(
+        action_chunk if configured_horizon is None else configured_horizon
+    )
+    if model_action_horizon < action_chunk:
+        raise ValueError(
+            f"model_action_horizon={model_action_horizon} must be at least "
+            f"num_action_chunks={action_chunk}."
+        )
+    return model_action_horizon
+
+
 def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
     """Build an OpenPI PyTorch Pi0/Pi0.5 model from ``actor.model`` config.
 
@@ -72,7 +87,7 @@ def get_model(cfg: Any, torch_dtype: Any = None) -> Any:
 
     pi0_kwargs = {
         "pi05": pi05,
-        "action_horizon": int(cfg.num_action_chunks),
+        "action_horizon": _resolve_model_action_horizon(cfg, model_cfg),
         "action_dim": int(model_cfg.model_action_dim),
         "paligemma_variant": str(model_cfg.paligemma_variant),
         "action_expert_variant": str(model_cfg.action_expert_variant),
