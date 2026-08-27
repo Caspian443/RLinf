@@ -123,6 +123,32 @@ def test_embodied_rollout_backend_is_opt_in():
     assert get_embodied_rollout_worker(phyai_cfg) is PhyAIWorker
 
 
+@pytest.mark.parametrize("plugin", ["pi05", "pi05_rl"])
+def test_phyai_worker_accepts_supported_plugins(monkeypatch, plugin):
+    def _init_base(worker, _cfg):
+        worker.enable_offload = False
+        worker.global_accelerator_ids = [0]
+
+    monkeypatch.setattr(MultiStepRolloutWorker, "__init__", _init_base)
+    cfg = OmegaConf.create({"rollout": {"phyai": {"plugin": plugin}}})
+
+    worker = PhyAIWorker(cfg)
+
+    assert worker._phyai_plugin == plugin
+
+
+def test_phyai_worker_rejects_unknown_plugin(monkeypatch):
+    def _init_base(worker, _cfg):
+        worker.enable_offload = False
+        worker.global_accelerator_ids = [0]
+
+    monkeypatch.setattr(MultiStepRolloutWorker, "__init__", _init_base)
+    cfg = OmegaConf.create({"rollout": {"phyai": {"plugin": "unknown"}}})
+
+    with pytest.raises(NotImplementedError, match="pi05_rl"):
+        PhyAIWorker(cfg)
+
+
 def test_training_forward_inputs_match_native_contract():
     worker = object.__new__(PhyAIWorker)
     worker._engine_device = torch.device("cpu")

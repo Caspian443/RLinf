@@ -79,9 +79,9 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._engine_dtype: torch.dtype | None = None
         self._normalize_pixels = False
 
-        if self._phyai_plugin != "pi05":
+        if self._phyai_plugin not in ("pi05", "pi05_rl"):
             raise NotImplementedError(
-                "PhyAIWorker currently supports only the 'pi05' engine plugin; "
+                "PhyAIWorker supports the 'pi05' and 'pi05_rl' engine plugins; "
                 f"got {self._phyai_plugin!r}."
             )
         if self.enable_offload:
