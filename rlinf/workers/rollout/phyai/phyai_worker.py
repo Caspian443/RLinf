@@ -33,15 +33,19 @@ from phyai_utils_tools.models.pi05 import PI05Processor
 from rlinf.config import torch_dtype_from_precision
 from rlinf.hybrid_engines.weight_syncer.bucket_syncer import BucketWeightSyncer
 from rlinf.scheduler import Worker
+from rlinf.utils.ckpt_convertor.openpi.openpi_rlinf_to_openpi_pytorch import (
+    new_to_old_state_dict,
+)
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 class _PhyAIWeightTarget(torch.nn.Module):
     """Adapt bucket syncer's ``load_state_dict`` calls to a PhyAI Engine."""
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, *, openpi_rlinf_layout: bool = False) -> None:
         super().__init__()
         self.engine = engine
+        self.openpi_rlinf_layout = openpi_rlinf_layout
 
     def load_state_dict(
         self,
@@ -50,6 +54,18 @@ class _PhyAIWeightTarget(torch.nn.Module):
         assign: bool = False,
     ) -> Any:
         del strict, assign
+        if self.openpi_rlinf_layout:
+            normalized = {
+                PhyAIWorker._actor_weight_name(name): tensor
+                for name, tensor in state_dict.items()
+            }
+            converted = new_to_old_state_dict(normalized)
+            converted.update(
+                (name, tensor)
+                for name, tensor in normalized.items()
+                if name.startswith("value_head.")
+            )
+            state_dict = converted
         self.engine.update_weights(state_dict)
         return None
 
@@ -259,7 +275,13 @@ class PhyAIWorker(MultiStepRolloutWorker):
             raise
 
         self._engine = engine
-        self._weight_target = _PhyAIWeightTarget(engine)
+        self._weight_target = _PhyAIWeightTarget(
+            engine,
+            openpi_rlinf_layout=(
+                self._phyai_plugin == "pi05_rl"
+                and str(self.model_cfg.get("model_type", "")) == "openpi_rlinf"
+            ),
+        )
         self._processor = processor
 
     @staticmethod
@@ -369,6 +391,64 @@ class PhyAIWorker(MultiStepRolloutWorker):
         )
         return request, processed
 
+    def _build_openpi_rlinf_forward_inputs(
+        self,
+        processed: Any,
+        rollout_result: Any,
+        actions: torch.Tensor,
+    ) -> dict[str, torch.Tensor]:
+        """Build the preprocessed replay contract consumed by openpi_rlinf."""
+        if processed.state is None:
+            raise RuntimeError("PhyAI processor did not retain normalized state.")
+
+        images = processed.pixel_values.to(device=self._engine_device)
+        if images.ndim != 5 or images.shape[1] != 2:
+            raise ValueError(
+                "openpi_rlinf pi0.5 replay requires two real camera tensors; "
+                f"got shape={tuple(images.shape)}."
+            )
+        batch_size = int(images.shape[0])
+        token_ids = processed.input_ids.to(device=self._engine_device)
+        token_mask = (
+            torch.arange(token_ids.shape[1], device=self._engine_device)[None, :]
+            < processed.lang_lens.to(device=self._engine_device)[:, None]
+        )
+
+        state = processed.state.to(device=self._engine_device, dtype=torch.float32)
+        model_action_dim = int(
+            self.model_cfg.get("openpi", {}).get(
+                "model_action_dim", rollout_result.actions.shape[-1]
+            )
+        )
+        if state.shape[-1] > model_action_dim:
+            raise ValueError(
+                f"Normalized state dim {state.shape[-1]} exceeds "
+                f"openpi_rlinf model_action_dim={model_action_dim}."
+            )
+        state = torch.nn.functional.pad(state, (0, model_action_dim - state.shape[-1]))
+
+        image_mask = torch.ones(
+            batch_size, dtype=torch.bool, device=self._engine_device
+        )
+        forward_inputs = {
+            "chains": rollout_result.chains,
+            "denoise_inds": rollout_result.denoise_inds,
+            "obs_state": state,
+            "tokenized_prompt": token_ids,
+            "tokenized_prompt_mask": token_mask,
+            "action": actions.to(device=self._engine_device).reshape(batch_size, -1),
+            "model_action": rollout_result.actions.reshape(batch_size, -1),
+            "obs_image__base_0_rgb": images[:, 0].permute(0, 2, 3, 1),
+            "obs_image__left_wrist_0_rgb": images[:, 1].permute(0, 2, 3, 1),
+            "obs_image__right_wrist_0_rgb": torch.zeros_like(images[:, 0]).permute(
+                0, 2, 3, 1
+            ),
+            "obs_image_mask__base_0_rgb": image_mask,
+            "obs_image_mask__left_wrist_0_rgb": image_mask,
+            "obs_image_mask__right_wrist_0_rgb": torch.zeros_like(image_mask),
+        }
+        return {key: value.contiguous() for key, value in forward_inputs.items()}
+
     def _build_training_forward_inputs(
         self,
         env_obs: dict[str, Any],
@@ -376,12 +456,18 @@ class PhyAIWorker(MultiStepRolloutWorker):
         rollout_result: Any,
         actions: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        """Build the legacy native OpenPI replay contract.
+        """Build the replay contract selected by the Actor model implementation.
 
-        The Actor intentionally receives raw observations and runs its existing
-        OpenPI transforms again. Only prompt tokens are reused from PhyAI so the
-        behavior and replay policies see exactly the same task tokenization.
+        Legacy OpenPI reprocesses raw observations in the Actor. Openpi_rlinf
+        consumes the canonical tensors already produced by the rollout processor.
         """
+        if str(self.model_cfg.get("model_type", "")) == "openpi_rlinf":
+            return self._build_openpi_rlinf_forward_inputs(
+                processed,
+                rollout_result,
+                actions,
+            )
+
         batch_size = int(rollout_result.actions.shape[0])
         token_ids = processed.input_ids.to(device=self._engine_device)
         token_mask = (

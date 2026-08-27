@@ -117,7 +117,9 @@ rollout:
     tokenizer_name: "/path/to/model/paligemma-3b-pt-224-tokenizer"
     vision_params_dtype: null
     use_cuda_graph: False
-    runtime: {}
+    runtime:
+      # Accommodates the official 64-env workload with one rollout worker.
+      flashinfer_workspace_bytes: 4294967296
     model_action_horizon: 10
 
 actor:

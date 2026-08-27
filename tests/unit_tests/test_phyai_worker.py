@@ -123,6 +123,45 @@ def test_embodied_rollout_backend_is_opt_in():
     assert get_embodied_rollout_worker(phyai_cfg) is PhyAIWorker
 
 
+def test_phyai_weight_target_converts_openpi_rlinf_layout():
+    engine = _FakeEngine()
+    target = _PhyAIWeightTarget(engine, openpi_rlinf_layout=True)
+    qkv = torch.arange(18, dtype=torch.float32).reshape(6, 3)
+    gating = torch.arange(24, dtype=torch.float32).reshape(2, 3, 4)
+    value_bias = torch.ones(4)
+
+    target.load_state_dict(
+        {
+            "model.img.encoder.layers.0.attn.in_proj_weight": qkv,
+            "model.llm.layers.0.mlps.1.w_gating": gating,
+            "value_head.mlp.0.bias": value_bias,
+        }
+    )
+
+    weights = engine.events[0][1]
+    vision_prefix = (
+        "paligemma_with_expert.paligemma.model.vision_tower.vision_model."
+        "encoder.layers.0.self_attn"
+    )
+    assert torch.equal(weights[f"{vision_prefix}.q_proj.weight"], qkv[:2])
+    assert torch.equal(weights[f"{vision_prefix}.k_proj.weight"], qkv[2:4])
+    assert torch.equal(weights[f"{vision_prefix}.v_proj.weight"], qkv[4:])
+    expert_prefix = "paligemma_with_expert.gemma_expert.model.layers.0.mlp"
+    assert torch.equal(weights[f"{expert_prefix}.gate_proj.weight"], gating[0].T)
+    assert torch.equal(weights[f"{expert_prefix}.up_proj.weight"], gating[1].T)
+    assert weights["value_head.mlp.0.bias"] is value_bias
+
+
+def test_phyai_weight_target_keeps_legacy_layout_unchanged():
+    engine = _FakeEngine()
+    target = _PhyAIWeightTarget(engine)
+    weights = {"model.weight": torch.ones(2, 2)}
+
+    target.load_state_dict(weights)
+
+    assert engine.events == [("update", weights)]
+
+
 @pytest.mark.parametrize("plugin", ["pi05", "pi05_rl"])
 def test_phyai_worker_accepts_supported_plugins(monkeypatch, plugin):
     def _init_base(worker, _cfg):
@@ -184,3 +223,40 @@ def test_training_forward_inputs_match_native_contract():
     assert not any(key.startswith("obs_image__") for key in inputs)
     assert inputs["action"].shape == (2, 35)
     assert inputs["model_action"].shape == (2, 320)
+
+
+def test_training_forward_inputs_match_openpi_rlinf_contract():
+    worker = object.__new__(PhyAIWorker)
+    worker._engine_device = torch.device("cpu")
+    worker.model_cfg = OmegaConf.create(
+        {
+            "model_type": "openpi_rlinf",
+            "openpi": {"model_action_dim": 32},
+        }
+    )
+    env_obs = {"states": torch.randn(2, 8)}
+    processed = SimpleNamespace(
+        state=torch.randn(2, 8),
+        input_ids=torch.arange(400).view(2, 200),
+        lang_lens=torch.tensor([7, 8]),
+        pixel_values=torch.randn(2, 2, 3, 224, 224),
+    )
+    rollout = SimpleNamespace(
+        actions=torch.randn(2, 10, 32),
+        chains=torch.randn(2, 4, 10, 32),
+        denoise_inds=torch.ones(2, 3, dtype=torch.long),
+    )
+
+    inputs = worker._build_training_forward_inputs(
+        env_obs, processed, rollout, torch.randn(2, 5, 7)
+    )
+
+    assert inputs["obs_state"].shape == (2, 32)
+    assert inputs["tokenized_prompt_mask"].sum(dim=1).tolist() == [7, 8]
+    assert inputs["obs_image__base_0_rgb"].shape == (2, 224, 224, 3)
+    assert inputs["obs_image__left_wrist_0_rgb"].shape == (2, 224, 224, 3)
+    assert not inputs["obs_image__right_wrist_0_rgb"].any()
+    assert inputs["obs_image_mask__base_0_rgb"].all()
+    assert inputs["obs_image_mask__left_wrist_0_rgb"].all()
+    assert not inputs["obs_image_mask__right_wrist_0_rgb"].any()
+    assert "observation/state" not in inputs
