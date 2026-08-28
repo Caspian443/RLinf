@@ -278,7 +278,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._weight_target = _PhyAIWeightTarget(
             engine,
             openpi_rlinf_layout=(
-                self._phyai_plugin == "pi05_rl"
+                self._phyai_plugin in ("pi05", "pi05_rl")
                 and str(self.model_cfg.get("model_type", "")) == "openpi_rlinf"
             ),
         )
