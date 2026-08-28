@@ -260,3 +260,32 @@ def test_training_forward_inputs_match_openpi_rlinf_contract():
     assert inputs["obs_image_mask__left_wrist_0_rgb"].all()
     assert not inputs["obs_image_mask__right_wrist_0_rgb"].any()
     assert "observation/state" not in inputs
+
+
+def test_build_request_preserves_processor_float_dtype():
+    worker = object.__new__(PhyAIWorker)
+    worker._engine_device = torch.device("cpu")
+    worker._engine_dtype = torch.bfloat16
+    worker._normalize_pixels = False
+    processed = SimpleNamespace(
+        pixel_values=torch.randn(2, 2, 3, 224, 224, dtype=torch.float32),
+        input_ids=torch.arange(400).view(2, 200),
+        lang_lens=torch.tensor([7, 8]),
+    )
+    worker._processor = SimpleNamespace(preprocess=lambda _inputs: processed)
+    env_obs = {
+        "main_images": torch.randint(
+            0, 256, (2, 224, 224, 3), dtype=torch.uint8
+        ),
+        "wrist_images": torch.randint(
+            0, 256, (2, 224, 224, 3), dtype=torch.uint8
+        ),
+        "states": torch.randn(2, 8),
+        "task_descriptions": ["task one", "task two"],
+    }
+
+    request, returned = worker._build_request(env_obs)
+
+    assert returned is processed
+    assert request.pixel_values.dtype is torch.float32
+    assert request.input_ids.dtype is torch.int64

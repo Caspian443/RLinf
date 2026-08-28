@@ -225,6 +225,11 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._normalize_pixels = bool(
             self._phyai_cfg.get("normalize_pixels", not self.only_eval)
         )
+        processor_dtype = self._optional_dtype(
+            self._phyai_cfg.get("processor_params_dtype", None)
+        )
+        if processor_dtype is None:
+            processor_dtype = dtype
         processor_kwargs = {
             "image_size": plugin_cfg.vision.image_size,
             "num_channels": plugin_cfg.vision.num_channels,
@@ -233,7 +238,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
             "normalize_pixels": self._normalize_pixels,
             "image_pad_value": float(self._phyai_cfg.get("image_pad_value", 0.0)),
             "device": self._engine_device,
-            "params_dtype": dtype,
+            "params_dtype": processor_dtype,
         }
         try:
             if self.only_eval and self._phyai_cfg.get(
@@ -383,9 +388,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
             }
         )
         request = PI05Request(
-            pixel_values=processed.pixel_values.to(
-                device=self._engine_device, dtype=self._engine_dtype
-            ),
+            pixel_values=processed.pixel_values.to(device=self._engine_device),
             input_ids=processed.input_ids.to(device=self._engine_device),
             lang_lens=processed.lang_lens.to(device=self._engine_device),
         )
