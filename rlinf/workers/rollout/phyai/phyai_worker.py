@@ -26,7 +26,10 @@ from phyai.engine import Engine, EngineArgs
 from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
-from phyai.models.pi05.scheduler_ws1_pi05 import PI05Request, PI05RolloutConfig
+from phyai.models.pi05.scheduler_ws1_pi05 import (
+    PI05Request,
+    PI05RolloutRequest,
+)
 from phyai.utils import load_config
 from phyai_utils_tools.models.pi05 import PI05Processor
 
@@ -133,10 +136,20 @@ class PhyAIWorker(MultiStepRolloutWorker):
                     f"PhyAI model_action_horizon={model_action_horizon} is smaller "
                     f"than num_action_chunks={self.model_cfg.num_action_chunks}."
                 )
+            openpi_cfg = self.model_cfg.get("openpi", {})
             plugin_cfg = replace(
                 plugin_cfg,
                 chunk_size=model_action_horizon,
                 num_inference_steps=int(self.model_cfg.num_steps),
+                config_name=str(openpi_cfg.get("config_name", plugin_cfg.config_name)),
+                action_chunk=int(
+                    openpi_cfg.get("action_chunk", self.model_cfg.num_action_chunks)
+                ),
+                detach_critic_input=bool(openpi_cfg.get("detach_critic_input", False)),
+                chunk_critic_input=bool(openpi_cfg.get("chunk_critic_input", False)),
+                add_value_head=bool(self.model_cfg.get("add_value_head", False)),
+                value_after_vlm=bool(openpi_cfg.get("value_after_vlm", False)),
+                value_vlm_mode=str(openpi_cfg.get("value_vlm_mode", "mean_token")),
             )
         engine_precision = self._phyai_cfg.get("params_dtype", self.model_cfg.precision)
         if engine_precision is None:
@@ -159,10 +172,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
         requested_cuda_graph = bool(
             self._phyai_cfg.get("use_cuda_graph", self.only_eval)
         )
-        if not self.only_eval and requested_cuda_graph:
-            raise ValueError(
-                "PhyAI PPO rollout requires rollout.phyai.use_cuda_graph=false."
-            )
         runtime_values.setdefault("use_cuda_graph", requested_cuda_graph)
 
         configured_max_batch_size = self._phyai_cfg.get("max_batch_size", None)
@@ -210,7 +219,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
                     weight_remap=self._actor_weight_name,
                     vision_params_dtype=vision_dtype,
                     inputs_image_shape=inputs_image_shape,
-                    add_value_head=not self.only_eval,
+                    capture_rollout=not self.only_eval and requested_cuda_graph,
                     require_full_hot_update=not self.only_eval,
                 ),
                 config=EngineConfig(
@@ -391,6 +400,24 @@ class PhyAIWorker(MultiStepRolloutWorker):
         )
         return request, processed
 
+    def _build_rollout_request(self, request: PI05Request) -> PI05RolloutRequest:
+        """Attach RLinf PPO sampling semantics to canonical model inputs."""
+        openpi_cfg = self.model_cfg.get("openpi", {})
+        return PI05RolloutRequest(
+            pixel_values=request.pixel_values,
+            input_ids=request.input_ids,
+            lang_lens=request.lang_lens,
+            noise=request.noise,
+            noise_method=str(openpi_cfg.get("noise_method", "flow_sde")),
+            noise_level=float(openpi_cfg.get("noise_level", 0.5)),
+            action_chunk=int(self.model_cfg.num_action_chunks),
+            action_dim=int(self.model_cfg.action_dim),
+            joint_logprob=bool(openpi_cfg.get("joint_logprob", False)),
+            ignore_last=bool(openpi_cfg.get("ignore_last", False)),
+            safe_get_logprob=bool(openpi_cfg.get("safe_get_logprob", False)),
+            compute_values=bool(self.model_cfg.get("add_value_head", False)),
+        )
+
     def _build_openpi_rlinf_forward_inputs(
         self,
         processed: Any,
@@ -516,16 +543,8 @@ class PhyAIWorker(MultiStepRolloutWorker):
         request, processed = self._build_request(env_obs)
         rollout_result = None
         if mode == "train":
-            openpi_cfg = self.model_cfg.get("openpi", {})
-            rollout_config = PI05RolloutConfig(
-                action_chunk=int(self.model_cfg.num_action_chunks),
-                action_dim=int(self.model_cfg.action_dim),
-                noise_method=str(openpi_cfg.get("noise_method", "flow_sde")),
-                noise_level=float(openpi_cfg.get("noise_level", 0.5)),
-            )
-            rollout_result = self._engine.rollout_step(
-                request, rollout_config=rollout_config
-            )
+            rollout_request = self._build_rollout_request(request)
+            rollout_result = self._engine.rollout_step(rollout_request)
             model_actions = rollout_result.actions
         else:
             model_actions = self._engine.step(request)

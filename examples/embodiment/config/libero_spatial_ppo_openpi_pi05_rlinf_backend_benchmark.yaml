@@ -105,7 +105,7 @@ rollout:
     precision: ${actor.model.precision}
 
   phyai:
-    plugin: pi05_rl
+    plugin: pi05
     checkpoint_dir: "/path/to/model/pi05_base"
     max_batch_size: null
     num_images: 2
@@ -116,7 +116,7 @@ rollout:
     norm_stats_path: "/path/to/model/RLinf-Pi05-LIBERO-SFT/physical-intelligence/libero/norm_stats.json"
     tokenizer_name: "/path/to/model/paligemma-3b-pt-224-tokenizer"
     vision_params_dtype: null
-    use_cuda_graph: False
+    use_cuda_graph: True
     runtime:
       # Accommodates the official 64-env workload with one rollout worker.
       flashinfer_workspace_bytes: 4294967296

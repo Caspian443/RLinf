@@ -17,6 +17,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from omegaconf import OmegaConf
+from phyai.models.pi05.scheduler_ws1_pi05 import (
+    PI05Request,
+    PI05RolloutRequest,
+)
 
 from rlinf.hybrid_engines.weight_syncer.bucket_syncer import BucketWeightSyncer
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -260,3 +264,68 @@ def test_training_forward_inputs_match_openpi_rlinf_contract():
     assert inputs["obs_image_mask__left_wrist_0_rgb"].all()
     assert not inputs["obs_image_mask__right_wrist_0_rgb"].any()
     assert "observation/state" not in inputs
+
+
+def test_build_request_casts_pixels_to_engine_dtype():
+    worker = object.__new__(PhyAIWorker)
+    worker._engine_device = torch.device("cpu")
+    worker._engine_dtype = torch.bfloat16
+    worker._normalize_pixels = False
+    processed = SimpleNamespace(
+        pixel_values=torch.randn(2, 2, 3, 224, 224, dtype=torch.float32),
+        input_ids=torch.arange(400).view(2, 200),
+        lang_lens=torch.tensor([7, 8]),
+    )
+    worker._processor = SimpleNamespace(preprocess=lambda _inputs: processed)
+    env_obs = {
+        "main_images": torch.randint(0, 256, (2, 224, 224, 3), dtype=torch.uint8),
+        "wrist_images": torch.randint(0, 256, (2, 224, 224, 3), dtype=torch.uint8),
+        "states": torch.randn(2, 8),
+        "task_descriptions": ["task one", "task two"],
+    }
+
+    request, returned = worker._build_request(env_obs)
+
+    assert returned is processed
+    assert request.pixel_values.dtype is torch.bfloat16
+    assert request.input_ids.dtype is torch.int64
+
+
+def test_build_rollout_request_uses_actor_sampling_config():
+    worker = object.__new__(PhyAIWorker)
+    worker.model_cfg = OmegaConf.create(
+        {
+            "num_action_chunks": 5,
+            "action_dim": 7,
+            "add_value_head": True,
+            "openpi": {
+                "noise_method": "flow_sde",
+                "noise_level": 0.25,
+                "joint_logprob": False,
+                "ignore_last": True,
+                "safe_get_logprob": True,
+            },
+        }
+    )
+    base = PI05Request(
+        pixel_values=torch.randn(2, 2, 3, 224, 224),
+        input_ids=torch.arange(400).view(2, 200),
+        lang_lens=torch.tensor([7, 8]),
+        noise=torch.randn(2, 10, 32),
+    )
+
+    request = worker._build_rollout_request(base)
+
+    assert isinstance(request, PI05RolloutRequest)
+    assert request.pixel_values is base.pixel_values
+    assert request.input_ids is base.input_ids
+    assert request.lang_lens is base.lang_lens
+    assert request.noise is base.noise
+    assert request.noise_method == "flow_sde"
+    assert request.noise_level == 0.25
+    assert request.action_chunk == 5
+    assert request.action_dim == 7
+    assert request.joint_logprob is False
+    assert request.ignore_last is True
+    assert request.safe_get_logprob is True
+    assert request.compute_values is True
