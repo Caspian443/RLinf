@@ -23,6 +23,8 @@ from phyai.models.pi05.scheduler_ws1_pi05 import (
 )
 
 from rlinf.hybrid_engines.weight_syncer.bucket_syncer import BucketWeightSyncer
+from rlinf.workers.actor import embodied_fsdp_actor_worker
+from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 from rlinf.workers.rollout.phyai import get_embodied_rollout_worker
 from rlinf.workers.rollout.phyai.phyai_worker import (
@@ -92,6 +94,25 @@ def _make_worker(*, fail: bool = False):
     worker.torch_platform = SimpleNamespace(empty_cache=lambda: None)
     worker.log_info = lambda _message: None
     return worker, engine
+
+
+def test_embodied_actor_seeds_before_model_setup(monkeypatch):
+    worker = object.__new__(EmbodiedFSDPActor)
+    worker.cfg = OmegaConf.create({"actor": {"seed": 42}})
+    worker._rank = 3
+    worker.enable_offload = False
+    events = []
+
+    monkeypatch.setattr(
+        embodied_fsdp_actor_worker,
+        "seed_everything",
+        lambda seed: events.append(("seed", seed)),
+    )
+    worker.setup_model_and_optimizer = lambda: events.append(("setup", None))
+
+    worker.init_worker()
+
+    assert events == [("seed", 45), ("setup", None)]
 
 
 @pytest.mark.asyncio
