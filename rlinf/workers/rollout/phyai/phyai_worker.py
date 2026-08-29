@@ -122,6 +122,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
         checkpoint_dir = str(
             self._phyai_cfg.get("checkpoint_dir", None) or self.model_cfg.model_path
         )
+        engine_checkpoint_dir = checkpoint_dir if self.only_eval else None
         plugin_cfg = load_config(checkpoint_dir, PI05Config)
         if not self.only_eval:
             model_action_horizon = self._phyai_cfg.get("model_action_horizon")
@@ -205,7 +206,9 @@ class PhyAIWorker(MultiStepRolloutWorker):
 
         self.log_info(
             "Launching PhyAI engine: "
-            f"plugin={self._phyai_plugin}, checkpoint={checkpoint_dir}, "
+            f"plugin={self._phyai_plugin}, config_checkpoint={checkpoint_dir}, "
+            f"weight_checkpoint={engine_checkpoint_dir}, "
+            f"defer_scheduler_setup={not self.only_eval}, "
             f"max_batch_size={max_batch_size}, num_images={num_images}, "
             f"device={self._engine_device}, dtype={dtype}."
         )
@@ -213,7 +216,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
             EngineArgs(
                 plugin=self._phyai_plugin,
                 plugin_args=PI05Args(
-                    checkpoint_dir=checkpoint_dir,
+                    checkpoint_dir=engine_checkpoint_dir,
                     max_batch_size=max_batch_size,
                     config=plugin_cfg,
                     weight_remap=self._actor_weight_name,
@@ -221,6 +224,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
                     inputs_image_shape=inputs_image_shape,
                     capture_rollout=not self.only_eval and requested_cuda_graph,
                     require_full_hot_update=not self.only_eval,
+                    defer_scheduler_setup=not self.only_eval,
                 ),
                 config=EngineConfig(
                     device=DeviceConfig(
