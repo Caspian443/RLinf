@@ -13,7 +13,6 @@ phyai:
   num_images: ${..model.openpi.num_images_in_input}
   processor_from_pretrained: True
   normalize_pixels: False
-  processor_params_dtype: null
   image_pad_value: 0.0
   vision_params_dtype: float32
   use_cuda_graph: True

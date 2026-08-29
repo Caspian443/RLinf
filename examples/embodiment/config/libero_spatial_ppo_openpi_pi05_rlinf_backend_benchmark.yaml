@@ -112,7 +112,6 @@ rollout:
     processor_from_pretrained: False
     normalize_pixels: True
     image_pad_value: 0.0
-    processor_params_dtype: float32
     state_dim: 8
     norm_stats_path: "/path/to/model/RLinf-Pi05-LIBERO-SFT/physical-intelligence/libero/norm_stats.json"
     tokenizer_name: "/path/to/model/paligemma-3b-pt-224-tokenizer"
