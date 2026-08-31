@@ -79,6 +79,7 @@ def _make_worker(*, fail: bool = False):
     worker._timer_metrics = {}
     worker._rank = 0
     worker._engine = engine
+    worker._debug_validate_finite = False
     worker._weight_target = _PhyAIWeightTarget(engine)
     worker.weight_syncer = _FakeBucketWeightSyncer(fail=fail)
     worker.actor_group_name = "actor"
@@ -185,6 +186,16 @@ def test_phyai_weight_target_keeps_legacy_layout_unchanged():
     target.load_state_dict(weights)
 
     assert engine.events == [("update", weights)]
+
+
+def test_phyai_weight_target_rejects_nonfinite_actor_bucket():
+    engine = _FakeEngine()
+    target = _PhyAIWeightTarget(engine, debug_validate_finite=True)
+
+    with pytest.raises(RuntimeError, match="model.weight"):
+        target.load_state_dict({"model.weight": torch.tensor([float("nan")])})
+
+    assert engine.events == []
 
 
 @pytest.mark.parametrize("plugin", ["pi05", "pi05_rl"])
@@ -350,3 +361,19 @@ def test_build_rollout_request_uses_actor_sampling_config():
     assert request.ignore_last is True
     assert request.safe_get_logprob is True
     assert request.compute_values is True
+
+
+def test_validate_finite_tensors_reports_each_failed_rollout_field():
+    with pytest.raises(RuntimeError, match=r"actions:.*chains:"):
+        PhyAIWorker._validate_finite_tensors(
+            actions=torch.tensor([1.0, float("nan")]),
+            chains=torch.tensor([float("inf"), 2.0]),
+            prev_values=torch.tensor([3.0]),
+        )
+
+
+def test_validate_finite_tensors_accepts_finite_rollout_state():
+    PhyAIWorker._validate_finite_tensors(
+        actions=torch.tensor([1.0, 2.0]),
+        prev_logprobs=torch.tensor([-0.5]),
+    )

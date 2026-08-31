@@ -45,10 +45,17 @@ from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 class _PhyAIWeightTarget(torch.nn.Module):
     """Adapt bucket syncer's ``load_state_dict`` calls to a PhyAI Engine."""
 
-    def __init__(self, engine: Engine, *, openpi_rlinf_layout: bool = False) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        openpi_rlinf_layout: bool = False,
+        debug_validate_finite: bool = False,
+    ) -> None:
         super().__init__()
         self.engine = engine
         self.openpi_rlinf_layout = openpi_rlinf_layout
+        self.debug_validate_finite = debug_validate_finite
 
     def load_state_dict(
         self,
@@ -57,6 +64,8 @@ class _PhyAIWeightTarget(torch.nn.Module):
         assign: bool = False,
     ) -> Any:
         del strict, assign
+        if self.debug_validate_finite:
+            PhyAIWorker._validate_finite_tensors(**state_dict)
         if self.openpi_rlinf_layout:
             normalized = {
                 PhyAIWorker._actor_weight_name(name): tensor
@@ -97,6 +106,9 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._engine_device: torch.device | None = None
         self._engine_dtype: torch.dtype | None = None
         self._normalize_pixels = False
+        self._debug_validate_finite = bool(
+            self._phyai_cfg.get("debug_validate_finite", False)
+        )
 
         if self._phyai_plugin not in ("pi05", "pi05_rl"):
             raise NotImplementedError(
@@ -294,6 +306,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 self._phyai_plugin in ("pi05", "pi05_rl")
                 and str(self.model_cfg.get("model_type", "")) == "openpi_rlinf"
             ),
+            debug_validate_finite=self._debug_validate_finite,
         )
         self._processor = processor
 
@@ -549,6 +562,13 @@ class PhyAIWorker(MultiStepRolloutWorker):
         if mode == "train":
             rollout_request = self._build_rollout_request(request)
             rollout_result = self._engine.rollout_step(rollout_request)
+            if self._debug_validate_finite:
+                self._validate_finite_tensors(
+                    actions=rollout_result.actions,
+                    chains=rollout_result.chains,
+                    prev_logprobs=rollout_result.prev_logprobs,
+                    prev_values=rollout_result.prev_values,
+                )
             model_actions = rollout_result.actions
         else:
             model_actions = self._engine.step(request)
@@ -563,6 +583,8 @@ class PhyAIWorker(MultiStepRolloutWorker):
             )
         actions = actions[:, :requested_chunks]
         actions = actions.to(dtype=torch.float32).contiguous()
+        if self._debug_validate_finite:
+            self._validate_finite_tensors(env_actions=actions)
 
         batch_size = actions.shape[0]
         if rollout_result is None:
@@ -585,6 +607,31 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 "expert_label_flag": False,
             }
         return actions, result
+
+    @staticmethod
+    def _validate_finite_tensors(**tensors: torch.Tensor) -> None:
+        """Fail fast on non-finite rollout state when diagnostics are enabled."""
+        failures = []
+        for name, tensor in tensors.items():
+            finite = torch.isfinite(tensor)
+            if bool(finite.all()):
+                continue
+            finite_values = tensor[finite]
+            finite_min = (
+                float(finite_values.min().item()) if finite_values.numel() else None
+            )
+            finite_max = (
+                float(finite_values.max().item()) if finite_values.numel() else None
+            )
+            failures.append(
+                f"{name}: shape={tuple(tensor.shape)}, dtype={tensor.dtype}, "
+                f"nonfinite={tensor.numel() - int(finite.sum().item())}/"
+                f"{tensor.numel()}, finite_range=[{finite_min}, {finite_max}]"
+            )
+        if failures:
+            raise RuntimeError(
+                "PhyAI rollout produced non-finite tensors: " + "; ".join(failures)
+            )
 
     def get_bootstrap_values(
         self, final_obs: dict[str, Any] | None
@@ -657,6 +704,16 @@ class PhyAIWorker(MultiStepRolloutWorker):
         except Exception:
             self._engine.abort_weight_update()
             raise
+        if self._debug_validate_finite:
+            entry = self._engine.entry
+            model = getattr(entry, "model", None)
+            if model is None:
+                raise RuntimeError(
+                    "PhyAI engine has no model after weight synchronization."
+                )
+            self._validate_finite_tensors(
+                **{f"engine.{name}": param for name, param in model.named_parameters()}
+            )
 
         self.version = applied_version
         if self.finished_episodes is None:
