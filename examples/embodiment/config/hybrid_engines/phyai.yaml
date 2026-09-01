@@ -8,6 +8,9 @@ phyai:
   plugin: pi05
   # Defaults to rollout.model.model_path when null.
   checkpoint_dir: null
+  # Optional PhyAI kernel-policy YAML. PHYAI_KERNEL_CONFIG remains an
+  # equivalent process-level override.
+  kernel_config: null
   # Defaults to the per-worker rollout batch size when null.
   max_batch_size: null
   num_images: ${..model.openpi.num_images_in_input}

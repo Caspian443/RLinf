@@ -198,18 +198,17 @@ def test_phyai_weight_target_rejects_nonfinite_actor_bucket():
     assert engine.events == []
 
 
-@pytest.mark.parametrize("plugin", ["pi05", "pi05_rl"])
-def test_phyai_worker_accepts_supported_plugins(monkeypatch, plugin):
+def test_phyai_worker_accepts_pi05_plugin(monkeypatch):
     def _init_base(worker, _cfg):
         worker.enable_offload = False
         worker.global_accelerator_ids = [0]
 
     monkeypatch.setattr(MultiStepRolloutWorker, "__init__", _init_base)
-    cfg = OmegaConf.create({"rollout": {"phyai": {"plugin": plugin}}})
+    cfg = OmegaConf.create({"rollout": {"phyai": {"plugin": "pi05"}}})
 
     worker = PhyAIWorker(cfg)
 
-    assert worker._phyai_plugin == plugin
+    assert worker._phyai_plugin == "pi05"
 
 
 def test_phyai_worker_rejects_unknown_plugin(monkeypatch):
@@ -220,7 +219,7 @@ def test_phyai_worker_rejects_unknown_plugin(monkeypatch):
     monkeypatch.setattr(MultiStepRolloutWorker, "__init__", _init_base)
     cfg = OmegaConf.create({"rollout": {"phyai": {"plugin": "unknown"}}})
 
-    with pytest.raises(NotImplementedError, match="pi05_rl"):
+    with pytest.raises(NotImplementedError, match="pi05"):
         PhyAIWorker(cfg)
 
 

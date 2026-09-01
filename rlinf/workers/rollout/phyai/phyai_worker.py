@@ -23,7 +23,7 @@ from typing import Any, Literal
 import torch
 from omegaconf import DictConfig, OmegaConf
 from phyai.engine import Engine, EngineArgs
-from phyai.engine_config import DeviceConfig, EngineConfig, RuntimeConfig
+from phyai.engine_config import DeviceConfig, EngineConfig, KernelConfig, RuntimeConfig
 from phyai.models.pi05.configuration_pi05 import PI05Config
 from phyai.models.pi05.main_pi05 import PI05Args
 from phyai.models.pi05.scheduler_ws1_pi05 import (
@@ -110,9 +110,9 @@ class PhyAIWorker(MultiStepRolloutWorker):
             self._phyai_cfg.get("debug_validate_finite", False)
         )
 
-        if self._phyai_plugin not in ("pi05", "pi05_rl"):
+        if self._phyai_plugin != "pi05":
             raise NotImplementedError(
-                "PhyAIWorker supports the 'pi05' and 'pi05_rl' engine plugins; "
+                "PhyAIWorker supports the 'pi05' engine plugin; "
                 f"got {self._phyai_plugin!r}."
             )
         if self.enable_offload:
@@ -186,6 +186,14 @@ class PhyAIWorker(MultiStepRolloutWorker):
             self._phyai_cfg.get("use_cuda_graph", self.only_eval)
         )
         runtime_values.setdefault("use_cuda_graph", requested_cuda_graph)
+        kernel_config_path = self._phyai_cfg.get("kernel_config")
+        kernel_cfg = KernelConfig(
+            config_path=(
+                str(Path(kernel_config_path).expanduser())
+                if kernel_config_path
+                else None
+            )
+        )
 
         configured_max_batch_size = self._phyai_cfg.get("max_batch_size", None)
         max_batch_size = int(
@@ -222,7 +230,8 @@ class PhyAIWorker(MultiStepRolloutWorker):
             f"weight_checkpoint={engine_checkpoint_dir}, "
             f"defer_scheduler_setup={not self.only_eval}, "
             f"max_batch_size={max_batch_size}, num_images={num_images}, "
-            f"device={self._engine_device}, dtype={dtype}."
+            f"device={self._engine_device}, dtype={dtype}, "
+            f"kernel_config={kernel_cfg.config_path}."
         )
         engine = Engine(
             EngineArgs(
@@ -242,6 +251,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
                     device=DeviceConfig(
                         target=str(self._engine_device), params_dtype=dtype
                     ),
+                    kernel=kernel_cfg,
                     runtime=RuntimeConfig(**runtime_values),
                 ),
             )
@@ -303,7 +313,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._weight_target = _PhyAIWeightTarget(
             engine,
             openpi_rlinf_layout=(
-                self._phyai_plugin in ("pi05", "pi05_rl")
+                self._phyai_plugin == "pi05"
                 and str(self.model_cfg.get("model_type", "")) == "openpi_rlinf"
             ),
             debug_validate_finite=self._debug_validate_finite,

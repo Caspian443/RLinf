@@ -108,6 +108,8 @@ rollout:
   phyai:
     plugin: pi05
     checkpoint_dir: "/path/to/model/pi05_base"
+    # Point this at phyai/examples/pi05/kernel_policy_rlinf_bf16.yaml.
+    kernel_config: ${oc.env:PHYAI_KERNEL_CONFIG,null}
     max_batch_size: null
     num_images: 2
     processor_from_pretrained: False
