@@ -30,7 +30,8 @@ runner:
     experiment_name: "libero_spatial_ppo_openpi_pi05"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  # The pi_RL appendix (Table 11) trains pi0.5 on LIBERO for 500 steps.
+  max_epochs: 500
   max_steps: -1
 
   only_eval: False

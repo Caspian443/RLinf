@@ -21,6 +21,8 @@ ARG ASCEND_BASE_IMAGE=swr.cn-south-1.myhuaweicloud.com/ascendhub/cann:${CANN_VER
 # MUSA lives on the Moore Threads registry, not Docker Hub.
 ARG MUSA_BASE_IMAGE=registry.mthreads.com/mcctest/ai/training-suite:${MUSA_VER}
 ARG FRANKA_BASE_IMAGE=${REGISTRY_MIRROR}ubuntu:20.04
+# Existing RLinf ManiSkill/LIBERO image used only by the PhyAI integration target.
+ARG RLINF_PHYAI_BASE_IMAGE=rlinf/rlinf:agentic-rlinf0.3-maniskill_libero
 
 
 ##################################################################################################
@@ -244,6 +246,172 @@ RUN link_assets
 
 # Set default env
 RUN echo "source ${UV_PATH}/openvla/bin/activate" >> ~/.bashrc
+
+
+##################################################################################################
+# Embodied: ManiSkill / Libero + PhyAI (isolated Python 3.12 runtimes)
+##################################################################################################
+FROM ${RLINF_PHYAI_BASE_IMAGE} AS embodied-maniskill_libero-phyai-image
+
+ARG RLINF_PHYAI_PYPI_INDEX=https://mirrors.aliyun.com/pypi/simple
+ENV UV_DEFAULT_INDEX=${RLINF_PHYAI_PYPI_INDEX}
+ENV PIP_INDEX_URL=${RLINF_PHYAI_PYPI_INDEX}
+ENV HF_ENDPOINT=https://hf-mirror.com
+ENV HF_HUB_DISABLE_XET=1
+ENV HF_HOME=/opt/venv/.cache/huggingface
+ENV UV_LINK_MODE=copy
+
+COPY . /opt/src/RLinf
+COPY --from=phyai . /opt/src/phyai
+
+# Git checkouts on the build host may use CRLF; container shell scripts need LF.
+RUN find /opt/src/RLinf /opt/src/phyai -type f -name '*.sh' \
+        -exec sed -i 's/\r$//' {} +
+
+# These source patches belong only to the integration stage. Keep existing
+# RLinf stages on transformers 4.x and make LIBERO assets real venv files
+# instead of symlinks into the temporary Hugging Face cache. Reuse the exact
+# ManiSkill version already present in the immutable parent image.
+RUN sed -i 's/transformers<=4\.57\.6/transformers==5.8.1/' /opt/src/RLinf/pyproject.toml && \
+    sed -i 's/retry_cmd libero-download-assets --skip-existing/true # deferred to a cacheable integration layer/' \
+        /opt/src/RLinf/requirements/install.sh && \
+    sed -i '/ManiSkill\.git@v3\.0\.0b22/c\    true # copied from the immutable base image' \
+        /opt/src/RLinf/requirements/install.sh && \
+    sed -i '/download_assets\.sh --assets maniskill/c\    true # included in the base image package' \
+        /opt/src/RLinf/requirements/install.sh && \
+    grep -q 'copied from the immutable base image' /opt/src/RLinf/requirements/install.sh && \
+    grep -q 'transformers==5.8.1' /opt/src/RLinf/pyproject.toml
+
+# Install RLinf core and the ManiSkill/LIBERO runtime without the RLinf OpenPI
+# package, whose patched transformers 4.x files cannot share this environment.
+RUN --mount=type=cache,target=/opt/venv/.cache \
+    cd /opt/src/RLinf && \
+    bash requirements/install.sh ${INSTALL_MIRROR_OPTION} \
+        --platform ${RLINF_PLATFORM} \
+        embodied \
+        --venv /opt/venv/rlinf-phyai \
+        --python 3.12 \
+        --torch 2.11.0 \
+        --env maniskill_libero \
+        --no-root \
+        --install-rlinf
+
+# ManiSkill 3.0.0b22 is pure Python; copy the exact distribution already
+# installed in the pinned parent image, leaving that source venv untouched.
+RUN cp -a /opt/venv/abot_m0/lib/python3.11/site-packages/mani_skill \
+        /opt/venv/rlinf-phyai/lib/python3.12/site-packages/ && \
+    cp -a /opt/venv/abot_m0/lib/python3.11/site-packages/mani_skill-3.0.0b22.dist-info \
+        /opt/venv/rlinf-phyai/lib/python3.12/site-packages/ && \
+    /opt/venv/rlinf-phyai/bin/python -c "import importlib.metadata as m; assert m.version('mani_skill') == '3.0.0b22'"
+
+# Keep partial Hugging Face downloads across retries, then copy the completed
+# assets into the venv so the final image contains no cache symlink.
+RUN --mount=type=cache,target=/var/cache/rlinf-libero-assets \
+    source /opt/venv/rlinf-phyai/bin/activate && \
+    libero-download-assets \
+        --assets-dir /var/cache/rlinf-libero-assets \
+        --force \
+        --no-cache && \
+    rm -rf /opt/venv/rlinf-phyai/lib/python3.12/site-packages/libero/libero/assets && \
+    mkdir -p /opt/venv/rlinf-phyai/lib/python3.12/site-packages/libero/libero/assets && \
+    cp -a /var/cache/rlinf-libero-assets/. /opt/venv/rlinf-phyai/lib/python3.12/site-packages/libero/libero/assets/ && \
+    rm -rf /opt/venv/rlinf-phyai/lib/python3.12/site-packages/libero/libero/assets/.cache
+
+# Preserve the RLinf runtime while resolving and installing the complete PhyAI
+# workspace into the same active environment. Reconcile shared transitive
+# dependencies after uv sync, including requirements declared by the copied
+# ManiSkill distribution.
+RUN --mount=type=cache,target=/opt/venv/.cache \
+    source /opt/venv/rlinf-phyai/bin/activate && \
+    cd /opt/src/phyai && \
+    uv sync --active --inexact --no-dev && \
+    python -c 'import importlib.metadata as m; print("\n".join(m.requires("mani_skill") or []))' \
+        > /tmp/mani-skill-requirements.txt && \
+    uv pip install \
+        -r /tmp/mani-skill-requirements.txt \
+        'numpy<2' \
+        'nvidia-ml-py<13.596.0a0' \
+        'fsspec[http]<=2025.3.0' \
+        'ml-dtypes<0.6' \
+        'opencv-python-headless<5' \
+        pytest-asyncio && \
+    uv pip check
+
+# rlinf-openpi ships a complete Transformers 4.53.2 fork and overwrites the
+# same package files used by stock Transformers 5.8.1. Keep it in a separate
+# venv, while reusing the large, immutable Torch 2.11 and LIBERO installation
+# from the PhyAI environment through a lower-priority .pth entry.
+#
+# rlinf-openpi 0.1.1 currently declares torch==2.7.1 and an unconstrained
+# lerobot dependency. Installing it with dependencies would downgrade Torch
+# and makes resolution depend on whichever lerobot release is newest. Install
+# the exact RLinf distributions without dependencies, then install the
+# repository's OpenPI runtime pins explicitly. Native pi0.5 inference does not
+# import lerobot.
+RUN --mount=type=cache,target=/opt/venv/.cache \
+    uv venv \
+        --python /opt/venv/rlinf-phyai/bin/python \
+        /opt/venv/rlinf-openpi && \
+    echo /opt/venv/rlinf-phyai/lib/python3.12/site-packages \
+        > /opt/venv/rlinf-openpi/lib/python3.12/site-packages/rlinf-base.pth && \
+    uv pip install \
+        --python /opt/venv/rlinf-openpi/bin/python \
+        'transformers==4.53.2' \
+        'tokenizers>=0.21,<0.22' \
+        'huggingface-hub>=0.30,<1.0' \
+        'numpy<2' \
+        'fsspec[http]<=2025.3.0' && \
+    uv pip install \
+        --python /opt/venv/rlinf-openpi/bin/python \
+        --no-deps \
+        'rlinf-openpi==0.1.1' \
+        'rlinf-transformer-openpi==4.53.2' && \
+    uv pip install \
+        --python /opt/venv/rlinf-openpi/bin/python \
+        -r /opt/src/RLinf/requirements/embodied/models/openpi.txt \
+        'numpy<2' \
+        'fsspec[http]<=2025.3.0' \
+        'augmax>=0.3.4' \
+        'beartype==0.19.0' \
+        'chex==0.1.90' \
+        'equinox>=0.11.8' \
+        'flax==0.10.2' \
+        'flatbuffers>=24.3.25' \
+        'gym-aloha>=0.1.1' \
+        'jaxtyping==0.2.36' \
+        'ml-collections==1.0.0' \
+        'numpydantic>=1.6.6' \
+        'opencv-python==4.11.0.86' \
+        'polars>=1.30.0' \
+        'sentencepiece>=0.2.0' \
+        'tqdm-loggable>=0.2' \
+        'treescope>=0.1.7' \
+        'wandb>=0.19.1' \
+        openpi-client && \
+    cp -r \
+        /opt/venv/rlinf-openpi/lib/python3.12/site-packages/openpi/models_pytorch/transformers_replace/. \
+        /opt/venv/rlinf-openpi/lib/python3.12/site-packages/transformers/ && \
+    PYTHONPATH=/opt/src/RLinf /opt/venv/rlinf-openpi/bin/python -c \
+        "import openpi, rlinf, torch, transformers; assert torch.__version__.startswith('2.11.0'); assert transformers.__version__ == '4.53.2'" && \
+    /opt/venv/rlinf-phyai/bin/python -c \
+        "import phyai, torch, transformers; assert torch.__version__.startswith('2.11.0'); assert transformers.__version__ == '5.8.1'" && \
+    ln -s /opt/venv/rlinf-phyai /opt/venv/phyai
+
+ENV PHYAI_VIRTUAL_ENV=/opt/venv/phyai
+ENV RLINF_OPENPI_VIRTUAL_ENV=/opt/venv/rlinf-openpi
+
+ENV VIRTUAL_ENV=/opt/venv/rlinf-phyai
+ENV PATH="/opt/venv/rlinf-phyai/bin:${PATH}"
+ENV PYTHONPATH=/opt/src/RLinf
+ENV REPO_PATH=/opt/src/RLinf
+ENV EMBODIED_PATH=/opt/src/RLinf/examples/embodiment
+
+# The parent stage activates openvla for interactive shells; make this stage's
+# integration environment the final activation instead.
+RUN echo "source /opt/venv/rlinf-phyai/bin/activate" >> ~/.bashrc
+
+WORKDIR /opt/src/RLinf
+
 
 FROM embodied-common-image AS embodied-behavior-openvlaoft-image
 

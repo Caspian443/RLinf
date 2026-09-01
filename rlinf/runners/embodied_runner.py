@@ -456,6 +456,30 @@ class EmbodiedRunner:
         self.log_queue.join()  # Wait for all queued logs to be processed
         self.log_thread.join(timeout=1.0)
 
+    def run_eval_only(self) -> dict:
+        """Evaluate restored actor weights without running a training step."""
+        start_time = time.time()
+        self.actor.set_global_step(self.global_step).wait()
+        self.rollout.set_global_step(self.global_step).wait()
+
+        with self.timer("sync_weights"):
+            self.update_rollout_weights()
+        with self.timer("eval"):
+            eval_metrics = self.evaluate()
+
+        eval_metrics = {f"eval/{key}": value for key, value in eval_metrics.items()}
+        self.metric_logger.log(data=eval_metrics, step=self.global_step)
+        print_metrics_table(
+            step=self.global_step,
+            total_steps=max(self.max_steps, 1),
+            start_time=start_time,
+            metrics=eval_metrics,
+            start_step=self.global_step,
+            log_path=self.metric_logger.log_path,
+        )
+        self._finish_run()
+        return eval_metrics
+
     def _should_profile_step(self, step_idx: int) -> bool:
         return self._profile_all_steps or (
             self._profile_steps is not None and step_idx in self._profile_steps
@@ -476,6 +500,9 @@ class EmbodiedRunner:
         self.logger.info(f"Closed profiling window at step {step_idx}")
 
     def run(self):
+        if self.cfg.runner.get("only_eval", False):
+            return self.run_eval_only()
+
         if self.cfg.runner.get("use_training_pipeline", False):
             return self.run_pipeline()
 
