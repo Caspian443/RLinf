@@ -329,6 +329,84 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         rollout_metrics = compute_rollout_metrics(self.rollout_batch)
         return rollout_metrics
 
+    @Worker.timer("actor/recompute_logprobs")
+    @torch.inference_mode()
+    def recompute_logprobs(self) -> None:
+        """Replay rollout transitions with the actor before the PPO update."""
+        if self.is_weight_offloaded:
+            self.load_param_and_grad(self.device)
+
+        if "forward_inputs" not in self.rollout_batch:
+            raise ValueError(
+                "Recomputing logprobs requires forward_inputs from the rollout worker."
+            )
+        if "prev_logprobs" not in self.rollout_batch:
+            raise ValueError(
+                "Recomputing logprobs requires prev_logprobs from the rollout worker."
+            )
+
+        behavior_logprobs = self.rollout_batch["prev_logprobs"]
+        time_dim, batch_dim = behavior_logprobs.shape[:2]
+        flat_batch = {
+            "forward_inputs": flatten_nested_tensor_time_batch(
+                self.rollout_batch["forward_inputs"], ("forward_inputs",)
+            ),
+            "prev_logprobs": behavior_logprobs.reshape(
+                -1, *behavior_logprobs.shape[2:]
+            ),
+        }
+        total_batch_size = flat_batch["prev_logprobs"].shape[0]
+        micro_batch_size = self.cfg.algorithm.get(
+            "logprob_forward_micro_batch_size", self.cfg.actor.micro_batch_size
+        )
+        assert micro_batch_size > 0, (
+            "algorithm.logprob_forward_micro_batch_size must be greater than 0."
+        )
+        num_chunks = (total_batch_size + micro_batch_size - 1) // micro_batch_size
+
+        self.model.eval()
+        recomputed_logprobs = []
+        for micro_batch in split_dict_to_chunk(flat_batch, num_chunks):
+            micro_batch = put_tensor_device(micro_batch, self.device)
+            model_kwargs = {}
+            if SupportedModel(self.cfg.actor.model.model_type) in [
+                SupportedModel.OPENVLA,
+                SupportedModel.OPENVLA_OFT,
+            ]:
+                model_kwargs["temperature"] = (
+                    self.cfg.rollout.sampling_params.temperature_train
+                )
+                model_kwargs["top_k"] = self.cfg.rollout.sampling_params.top_k
+            elif SupportedModel(self.cfg.actor.model.model_type) in [
+                SupportedModel.GR00T,
+                SupportedModel.GR00T_N1D6,
+                SupportedModel.GR00T_N1D7,
+                SupportedModel.ABOT_M0,
+            ]:
+                model_kwargs["prev_logprobs"] = micro_batch["prev_logprobs"]
+
+            with self.amp_context:
+                output_dict = self.model(
+                    forward_inputs=micro_batch["forward_inputs"],
+                    compute_logprobs=True,
+                    compute_entropy=False,
+                    compute_values=False,
+                    use_cache=False,
+                    **model_kwargs,
+                )
+            recomputed_logprobs.append(output_dict["logprobs"].detach().float().cpu())
+
+        recomputed_logprobs = torch.cat(recomputed_logprobs, dim=0)
+        expected_shape = (total_batch_size, *behavior_logprobs.shape[2:])
+        if recomputed_logprobs.shape != expected_shape:
+            raise ValueError(
+                f"Recomputed logprobs shape {tuple(recomputed_logprobs.shape)} must "
+                f"match rollout logprobs shape {expected_shape}."
+            )
+        self.rollout_batch["recomputed_logprobs"] = recomputed_logprobs.reshape(
+            time_dim, batch_dim, *recomputed_logprobs.shape[1:]
+        )
+
     @Worker.timer("actor/compute_opd_teacher_logprobs")
     def compute_opd_teacher_logprobs(self) -> None:
         assert self.rollout_batch.get("teacher_logprobs", None) is None, (
@@ -607,7 +685,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         micro_batch = put_tensor_device(micro_batch, self.device)
         backward_ctx = self.before_micro_batch(self.model, is_last_micro_batch=is_last)
         advantages = micro_batch["advantages"]
-        prev_logprobs = micro_batch["prev_logprobs"]
+        behavior_logprobs = micro_batch["prev_logprobs"]
+        prev_logprobs = micro_batch.get("recomputed_logprobs", behavior_logprobs)
         returns = micro_batch.get("returns", None)
         prev_values = micro_batch.get("prev_values", None)
         loss_mask = micro_batch.get("loss_mask", None)
@@ -646,7 +725,8 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             SupportedModel.GR00T_N1D7,
             SupportedModel.ABOT_M0,
         ]:
-            prev_logprobs = output_dict["prev_logprobs"]
+            if "recomputed_logprobs" not in micro_batch:
+                prev_logprobs = output_dict["prev_logprobs"]
 
         loss_kwargs = {
             "loss_type": self.cfg.algorithm.loss_type,
@@ -669,6 +749,16 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             "task_type": self.cfg.runner.task_type,
             "critic_warmup": self.optimizer_steps < self.critic_warmup_steps,
         }
+        if self.cfg.algorithm.get("importance_sampling_fix", False):
+            if "recomputed_logprobs" not in micro_batch:
+                raise ValueError(
+                    "importance_sampling_fix requires recomputed_logprobs. Enable "
+                    "rollout.recompute_logprobs before training."
+                )
+            loss_kwargs["rollout_logprobs"] = behavior_logprobs
+            loss_kwargs["importance_sampling_clip"] = (
+                self.cfg.algorithm.importance_sampling_clip
+            )
 
         if SupportedModel(self.cfg.actor.model.model_type) in [
             SupportedModel.GR00T_N1D6,

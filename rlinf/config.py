@@ -984,6 +984,31 @@ def validate_embodied_cfg(cfg):
                     "max_new_token", None
                 )
 
+        if not only_eval:
+            importance_sampling_fix = algorithm_cfg.get(
+                "importance_sampling_fix", False
+            )
+            cfg.rollout.recompute_logprobs = cfg.rollout.get(
+                "recompute_logprobs", False
+            ) or bool(importance_sampling_fix)
+            if importance_sampling_fix:
+                assert cfg.algorithm.loss_type in {"actor", "actor_critic"}, (
+                    "algorithm.importance_sampling_fix for synchronous embodied "
+                    "training requires loss_type 'actor' or 'actor_critic'."
+                )
+                importance_sampling_clip = algorithm_cfg.get(
+                    "importance_sampling_clip", None
+                )
+                assert (
+                    importance_sampling_clip is not None
+                    and importance_sampling_clip > 0
+                ), "algorithm.importance_sampling_clip must be greater than 0."
+            if cfg.rollout.recompute_logprobs:
+                assert not cfg.runner.get("use_training_pipeline", False), (
+                    "rollout.recompute_logprobs is not supported with "
+                    "runner.use_training_pipeline=True."
+                )
+
     if not only_eval and cfg.runner.get("use_training_pipeline", False):
         assert cfg.algorithm.adv_type == "gae", (
             "algorithm.adv_type only supports 'gae' now"

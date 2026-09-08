@@ -72,6 +72,9 @@ class EmbodiedRunner:
         self.reward = reward
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
         self._weight_sync_count = 0
+        self.recompute_logprobs = bool(
+            self.cfg.rollout.get("recompute_logprobs", False)
+        )
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
         )
@@ -549,6 +552,10 @@ class EmbodiedRunner:
                     rollout_handle.wait()
                     if self.reward is not None:
                         reward_handle.wait()
+
+                if self.recompute_logprobs:
+                    with self.timer("recompute_logprobs"):
+                        self.actor.recompute_logprobs().wait()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
