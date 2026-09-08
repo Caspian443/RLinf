@@ -335,7 +335,7 @@ class Cluster:
         try:
             # First try to connect to an existing Ray cluster
             ray_init_kwargs: dict[str, Any] = {
-                "address": "auto",
+                "address": os.environ.get("RAY_ADDRESS", "auto"),
                 "logging_level": Cluster.LOGGING_LEVEL,
                 "namespace": Cluster.NAMESPACE,
             }

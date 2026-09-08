@@ -15,6 +15,7 @@
 import io
 import itertools
 import logging
+import os
 import threading
 import time
 from contextlib import contextmanager, nullcontext
@@ -44,6 +45,11 @@ from .async_work import AsyncFuncWork, AsyncWork
 
 if TYPE_CHECKING:
     from .collective import Collective
+
+
+def _ipc_collect() -> None:
+    if os.environ.get("RLINF_SKIP_IPC_COLLECT") != "1":
+        Worker.torch_platform.ipc_collect()
 
 
 @dataclass
@@ -1794,7 +1800,7 @@ class CollectiveGroup:
             device=CollectiveGroup.CPU,
             comm_id=comm_id,
         )
-        Worker.torch_platform.ipc_collect()
+        _ipc_collect()
 
     def _recv_single_tensor_via_ipc(
         self, tensor: torch.Tensor, comm_id: int, async_op: bool = False
@@ -1824,7 +1830,7 @@ class CollectiveGroup:
             del remote_tensor
             zero_tensor = torch.tensor(0, dtype=torch.long, device="cpu")
             self._recv(zero_tensor, CollectiveGroup.CPU, comm_id)
-            Worker.torch_platform.ipc_collect()
+            _ipc_collect()
             return None
 
         if async_op:
@@ -1878,7 +1884,7 @@ class CollectiveGroup:
                     CollectiveGroup.CPU,
                     comm_id=comm_id,
                 )
-                Worker.torch_platform.ipc_collect()
+                _ipc_collect()
             else:
                 self._send(tensor, CollectiveGroup.ACCEL, comm_id=comm_id)
 
@@ -1923,7 +1929,7 @@ class CollectiveGroup:
                 del remote_tensor
                 zero_tensor = torch.tensor(0, dtype=torch.long, device="cpu")
                 self._recv(zero_tensor, CollectiveGroup.CPU, comm_id)
-                Worker.torch_platform.ipc_collect()
+                _ipc_collect()
                 return None
             else:
                 return self._recv(tensor, CollectiveGroup.ACCEL, comm_id)
@@ -1966,7 +1972,7 @@ class CollectiveGroup:
             device=CollectiveGroup.CPU,
             comm_id=comm_id,
         )
-        Worker.torch_platform.ipc_collect()
+        _ipc_collect()
 
         if async_op:
             return work
@@ -2004,7 +2010,7 @@ class CollectiveGroup:
         remote_tensors.clear()
         zero_tensor = torch.tensor(0, dtype=torch.long, device="cpu")
         self._recv(zero_tensor, CollectiveGroup.CPU, comm_id)
-        Worker.torch_platform.ipc_collect()
+        _ipc_collect()
 
         return tensors
 

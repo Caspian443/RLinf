@@ -71,6 +71,7 @@ class EmbodiedRunner:
         self.critic = critic
         self.reward = reward
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
+        self._weight_sync_count = 0
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
         )

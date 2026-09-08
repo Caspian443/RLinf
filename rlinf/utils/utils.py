@@ -36,7 +36,8 @@ def clear_memory(sync=True):
     if sync:
         Worker.torch_platform.synchronize()
     gc.collect()
-    Worker.torch_platform.ipc_collect()
+    if os.environ.get("RLINF_SKIP_IPC_COLLECT") != "1":
+        Worker.torch_platform.ipc_collect()
     Worker.torch_platform.empty_cache()
 
 
