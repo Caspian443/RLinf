@@ -102,6 +102,34 @@ The following first provides an example configuration for an embodied task:
 
       huber_delta: 10.0         # Delta parameter for Huber loss in value training
 
+When rollout generation and actor training use different inference implementations,
+their action log probabilities may differ even after synchronizing the same weights.
+Synchronous embodied PPO can replay the sampled transitions with the actor and apply
+the same importance-sampling correction used by reasoning training:
+
+.. code-block:: yaml
+
+   algorithm:
+      importance_sampling_fix: True
+      importance_sampling_clip: 1.0
+      logprob_forward_micro_batch_size: 128  # Defaults to actor.micro_batch_size
+
+   rollout:
+      recompute_logprobs: True
+
+Enabling ``algorithm.importance_sampling_fix`` makes the runner recompute
+log-probabilities even when ``rollout.recompute_logprobs`` is omitted. Let :math:`q` be
+the rollout behavior policy and :math:`p` the actor replay policy. The correction
+multiplies the advantage by :math:`\min(p/q,\;c)` and uses :math:`p` as the PPO
+old-policy anchor. The ratio is calculated at the configured ``logprob_type``
+granularity. Value predictions and GAE still use the values returned by rollout.
+
+This mode requires synchronous, non-pipelined embodied training with
+``loss_type: actor`` or ``loss_type: actor_critic``. Monitor
+``actor/importance_sampling_weight``, ``actor/importance_sampling_clip_fraction``,
+``actor/behav_approx_kl``, and ``actor/recomputed_logprob_abs_diff`` to measure
+rollout-actor divergence.
+
 3.2. LLM Reasoning Tasks
 ~~~~~~~~~~~~~~~~~~~~~~~~
 
