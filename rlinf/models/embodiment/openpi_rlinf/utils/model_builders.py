@@ -36,16 +36,6 @@ from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import build_rlt_confi
 logger = logging.getLogger(__name__)
 
 
-def _resolve_data_kwargs(cfg):
-    """Read the optional ``openpi_data`` override block as a plain dict."""
-    from omegaconf import OmegaConf
-
-    data_kwargs = OmegaConf.select(cfg, "openpi_data", default=None)
-    if data_kwargs is not None:
-        data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
-    return data_kwargs
-
-
 def _build_eval_model(
     cfg,
     model_cfg,
@@ -68,18 +58,11 @@ def _build_eval_model(
         OpenPiPytorchEvalActionModel,
     )
     from rlinf.models.embodiment.openpi_rlinf.transforms_pipeline import (
-        build_openpi_transforms,
+        build_openpi_transforms_from_model_config,
     )
 
-    config_name = str(OmegaConf.select(model_cfg, "config_name", default=""))
-    if not config_name:
-        raise ValueError(
-            "actor.model.openpi.config_name is required for task='eval' "
-            "(it selects the upstream openpi TrainConfig, e.g. 'pi05_behavior')."
-        )
-
-    input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+    config_name, input_transforms, output_transforms = (
+        build_openpi_transforms_from_model_config(cfg)
     )
 
     eval_model = OpenPiPytorchEvalActionModel(
@@ -134,9 +117,8 @@ def _build_rl_model(
     """Build the RL variant: openpi.transforms pipeline + value head + chain
     sampler + optional train-expert-only freeze.
 
-    Uses :func:`build_openpi_transforms` to derive the shared transforms
-    pipeline (same logic the eval task path runs) and layers the PPO-only
-    knobs (``rl_cfg``, value head, freeze) on top.
+    Uses the shared model-config transform builder (the same path as eval) and
+    layers the PPO-only knobs (``rl_cfg``, value head, freeze) on top.
     """
     from omegaconf import OmegaConf
 
@@ -145,18 +127,11 @@ def _build_rl_model(
         OpenPiPytorchRLConfig,
     )
     from rlinf.models.embodiment.openpi_rlinf.transforms_pipeline import (
-        build_openpi_transforms,
+        build_openpi_transforms_from_model_config,
     )
 
-    config_name = str(OmegaConf.select(model_cfg, "config_name", default=""))
-    if not config_name:
-        raise ValueError(
-            "actor.model.openpi.config_name is required for task='rl' "
-            "(it selects the upstream openpi TrainConfig, e.g. 'pi05_behavior')."
-        )
-
-    input_transforms, output_transforms = build_openpi_transforms(
-        cfg.model_path, config_name, data_kwargs=_resolve_data_kwargs(cfg)
+    config_name, input_transforms, output_transforms = (
+        build_openpi_transforms_from_model_config(cfg)
     )
 
     rl_cfg = OpenPiPytorchRLConfig(

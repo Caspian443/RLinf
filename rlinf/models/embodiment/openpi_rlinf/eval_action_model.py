@@ -14,12 +14,10 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
 from typing import Any, Literal, Sequence
 
 import numpy as np
 import torch
-from torch.utils._pytree import tree_map
 
 from rlinf.models.embodiment.openpi_rlinf.openpi_action_model import (
     OpenPiPytorchActionModel,
@@ -27,13 +25,12 @@ from rlinf.models.embodiment.openpi_rlinf.openpi_action_model import (
 from rlinf.models.embodiment.openpi_rlinf.pi0_model import model as pi0_model_module
 from rlinf.models.embodiment.openpi_rlinf.pi0_model.model import Observation
 from rlinf.models.embodiment.openpi_rlinf.pi0_model.pi0 import Pi0
+from rlinf.models.embodiment.openpi_rlinf.transforms_pipeline import (
+    OpenPITransformRunner,
+)
 from rlinf.models.embodiment.openpi_rlinf.utils.rlt_utils import (
     OpenPiPytorchRLTConfig,
 )
-
-
-def _to_numpy(x):
-    return np.asarray(x.detach().cpu()) if torch.is_tensor(x) else x
 
 
 class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
@@ -80,8 +77,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         self.state_indices = list(state_indices) if state_indices else None
 
         # openpi.transforms pipeline state (installed by :meth:`setup_wrappers`).
-        self._input_transform_fn = None
-        self._output_transform_fn = None
+        self._transform_runner: OpenPITransformRunner | None = None
 
     # -------------------------------------------------------- transforms glue
 
@@ -98,18 +94,23 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         ``output_transforms`` is the matching reverse pipeline used to turn
         sampled model actions back into env-frame actions.
         """
-        from openpi.transforms import compose
+        self._transform_runner = OpenPITransformRunner(
+            transforms,
+            output_transforms,
+            config_name=self.config_name,
+            state_indices=self.state_indices,
+            action_chunk=self.action_chunk,
+            device=self.device,
+        )
 
-        self._input_transform_fn = compose(transforms)
-        self._output_transform_fn = compose(output_transforms)
-
-    def _ensure_wrappers(self) -> None:
-        if self._input_transform_fn is None or self._output_transform_fn is None:
+    def _ensure_wrappers(self) -> OpenPITransformRunner:
+        if self._transform_runner is None:
             raise RuntimeError(
                 f"{type(self).__name__}.setup_wrappers(...) must be called "
                 "after construction (the factory does this); the openpi "
                 "transforms pipeline is not yet installed."
             )
+        return self._transform_runner
 
     def _select_configured_state(self, states):
         """Select a configured subset of the raw env state (openpi parity).
@@ -119,25 +120,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         identity passthrough; a configured index list fancy-indexes the last
         dim so future non-BEHAVIOR envs can reuse the generic repack.
         """
-        indices = self.state_indices
-        if not indices:
-            return states
-
-        if hasattr(states, "shape"):
-            state_dim = states.shape[-1]
-        else:
-            state_dim = np.asarray(states).shape[-1]
-        if state_dim == len(indices):
-            return states
-        if state_dim <= max(indices):
-            raise ValueError(
-                f"Cannot select state_indices={indices} from state dim {state_dim}."
-            )
-
-        if torch.is_tensor(states):
-            index_tensor = torch.as_tensor(indices, device=states.device)
-            return states.index_select(-1, index_tensor)
-        return np.asarray(states)[..., indices]
+        return self._ensure_wrappers().select_state(states)
 
     def _repack_env_obs(self, env_obs: dict) -> dict:
         """Map the env's observation dict to the ``observation/*`` keys the
@@ -154,24 +137,7 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
         camera views are added only when the env actually provides them
         (BEHAVIOR, for instance, emits no ``extra_view_images`` key).
         """
-        env_states = self._select_configured_state(env_obs["states"])
-        processed_obs = {
-            "observation/image": env_obs["main_images"],
-            "prompt": env_obs["task_descriptions"],
-        }
-        if "calvin" in self.config_name:
-            processed_obs["observation/state_ee_pos"] = env_states[:, :3]
-            processed_obs["observation/state_ee_rot"] = env_states[:, 3:6]
-            processed_obs["observation/state_gripper"] = env_states[:, 6:7]
-        else:
-            processed_obs["observation/state"] = env_states
-        wrist_images = env_obs.get("wrist_images")
-        if wrist_images is not None:
-            processed_obs["observation/wrist_image"] = wrist_images
-        extra_view_images = env_obs.get("extra_view_images")
-        if extra_view_images is not None:
-            processed_obs["observation/extra_view_image"] = extra_view_images
-        return processed_obs
+        return self._ensure_wrappers().repack_env_obs(env_obs)
 
     def input_transform(self, obs: dict, transpose: bool = False) -> dict:
         """Apply the openpi input pipeline per-sample then recombine into a batched dict.
@@ -185,102 +151,16 @@ class OpenPiPytorchEvalActionModel(OpenPiPytorchActionModel):
           ``tokenized_prompt`` keys present) — re-runs the pipeline using the
           cached tokens rather than re-tokenising every micro-batch.
         """
-        self._ensure_wrappers()
-        inputs = tree_map(lambda x: x, obs)
-        first_process = "prompt" in inputs.keys()
-        if first_process:
-            inputs.pop("prompt")
-        else:
-            inputs = {k: inputs[k] for k in inputs.keys() if "/" in k}
-
-        inputs = tree_map(_to_numpy, inputs)
-        batch_size = next(v.shape[0] for v in inputs.values() if hasattr(v, "shape"))
-
-        batch_samples = []
-        for i in range(batch_size):
-            sample = tree_map(lambda x: x[i], inputs)
-            if transpose:
-                sample = tree_map(
-                    lambda x: (
-                        x.transpose(1, 2, 0)
-                        if isinstance(x, np.ndarray) and x.ndim == 3
-                        else x
-                    ),
-                    sample,
-                )
-            if first_process:
-                prompts = obs["prompt"]
-                if isinstance(prompts, np.ndarray):
-                    prompts = prompts.tolist()
-                sample["prompt"] = prompts[i]
-            else:
-                # Pipeline still runs Tokenize, but the cached tokens below
-                # overwrite its output — placeholder text is fine.
-                sample["prompt"] = "xxxx"
-            batch_samples.append(sample)
-
-        with ThreadPoolExecutor(max_workers=min(len(batch_samples), 8)) as ex:
-            transformed = list(ex.map(self._input_transform_fn, batch_samples))
-
-        recombined = tree_map(
-            lambda *xs: torch.from_numpy(np.asarray(xs).copy()),
-            *transformed,
-        )
-        if not first_process:
-            recombined["tokenized_prompt"] = obs["tokenized_prompt"]
-            recombined["tokenized_prompt_mask"] = obs["tokenized_prompt_mask"]
-        return recombined
+        return self._ensure_wrappers().input_transform(obs, transpose=transpose)
 
     def output_transform(self, outputs: dict) -> dict:
         """Apply the openpi output pipeline per-sample then recombine."""
-        self._ensure_wrappers()
-        batch_size = outputs["actions"].shape[0]
-        transformed = []
-        for i in range(batch_size):
-            sample = tree_map(
-                lambda x: _to_numpy(x[i]) if torch.is_tensor(x) else x[i],
-                outputs,
-            )
-            sample = self._output_transform_fn(sample)
-            transformed.append(sample)
-        recombined = tree_map(
-            lambda *xs: torch.from_numpy(np.asarray(xs).copy()),
-            *transformed,
-        )
-        if self.action_chunk is not None:
-            recombined["actions"] = recombined["actions"][:, : self.action_chunk]
-        return recombined
+        return self._ensure_wrappers().output_transform(outputs)
 
     def _observation_dict_to_device(self, processed: dict) -> Observation:
         """Convert a per-key dict (from :meth:`input_transform`) into a device-resident :class:`Observation`."""
-        device = self.device
-        obs = Observation.from_dict(processed)
-
-        def _move(x):
-            return x.to(device) if isinstance(x, torch.Tensor) else x
-
-        def _move_state(x):
-            # The openpi Normalize stage runs in float64 (its norm_stats arrays
-            # are float64); cast state back to float32 to match the legacy eval
-            # processor (which did a final ``.float()``) and the model's compute
-            # dtype. For pi05 the continuous state is unused (only the discrete
-            # state tokens in the prompt are), but pi0 feeds it through
-            # ``state_proj`` so float32 keeps the linear layer's dtype aligned.
-            return (
-                x.to(device=device, dtype=torch.float32)
-                if isinstance(x, torch.Tensor)
-                else x
-            )
-
-        return Observation(
-            images={k: _move(v) for k, v in obs.images.items()},
-            image_masks={k: _move(v) for k, v in obs.image_masks.items()},
-            state=_move_state(obs.state),
-            tokenized_prompt=_move(obs.tokenized_prompt),
-            tokenized_prompt_mask=_move(obs.tokenized_prompt_mask),
-            token_ar_mask=_move(obs.token_ar_mask),
-            token_loss_mask=_move(obs.token_loss_mask),
-            pcd_xyz=_move(obs.pcd_xyz),
+        return self._ensure_wrappers().observation_to_device(
+            processed, device=self.device
         )
 
     # ------------------------------------------------------------------ rollout
