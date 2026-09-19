@@ -910,6 +910,17 @@ def validate_embodied_cfg(cfg):
         f"Model type: '{model_cfg.model_type}' is not an embodied model. "
         f"Supported embodied models: {sorted([x.value for x in EMBODIED_MODEL])}."
     )
+    rollout_backend = str(cfg.rollout.get("rollout_backend", "huggingface")).lower()
+    if rollout_backend == "hf":
+        rollout_backend = "huggingface"
+    if rollout_backend == "phyai":
+        assert model_type == SupportedModel.OPENPI_RLINF, (
+            "rollout_backend='phyai' currently requires model_type='openpi_rlinf'."
+        )
+        if not only_eval:
+            assert cfg.weight_syncer.get("type") == "bucket", (
+                "rollout_backend='phyai' requires weight_syncer.type='bucket'."
+            )
     with open_dict(cfg):
         cfg.runner.val_check_interval = cfg.runner.get("val_check_interval", -1)
     enable_eval = cfg.runner.val_check_interval > 0 or only_eval
@@ -983,6 +994,38 @@ def validate_embodied_cfg(cfg):
                 sampling_params.max_new_tokens = algorithm_cfg.length_params.get(
                     "max_new_token", None
                 )
+
+        if not only_eval:
+            importance_sampling_fix = algorithm_cfg.get(
+                "importance_sampling_fix", False
+            )
+            recompute_logprobs = bool(
+                cfg.rollout.get("recompute_logprobs", False) or importance_sampling_fix
+            )
+            if importance_sampling_fix:
+                assert cfg.algorithm.loss_type in {"actor", "actor_critic"}, (
+                    "algorithm.importance_sampling_fix for synchronous embodied "
+                    "training requires loss_type 'actor' or 'actor_critic'."
+                )
+                importance_sampling_clip = algorithm_cfg.get(
+                    "importance_sampling_clip", None
+                )
+                assert (
+                    importance_sampling_clip is not None
+                    and importance_sampling_clip > 0
+                ), "algorithm.importance_sampling_clip must be greater than 0."
+            if recompute_logprobs:
+                assert not cfg.runner.get("use_training_pipeline", False), (
+                    "rollout.recompute_logprobs is not supported with "
+                    "runner.use_training_pipeline=True."
+                )
+                assert (
+                    algorithm_cfg.get(
+                        "logprob_forward_micro_batch_size",
+                        cfg.actor.micro_batch_size,
+                    )
+                    > 0
+                ), "algorithm.logprob_forward_micro_batch_size must be positive."
 
     if not only_eval and cfg.runner.get("use_training_pipeline", False):
         assert cfg.algorithm.adv_type == "gae", (

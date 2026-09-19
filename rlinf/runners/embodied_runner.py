@@ -71,6 +71,11 @@ class EmbodiedRunner:
         self.critic = critic
         self.reward = reward
         self.weight_sync_interval = self.cfg.runner.weight_sync_interval
+        self._rollout_weights_initialized = False
+        self.recompute_logprobs = bool(
+            self.cfg.rollout.get("recompute_logprobs", False)
+            or self.cfg.algorithm.get("importance_sampling_fix", False)
+        )
         self.overlap_env_bootstrap = bool(
             self.cfg.runner.get("overlap_env_bootstrap", False)
         )
@@ -189,6 +194,14 @@ class EmbodiedRunner:
         actor_handle: Handle = self.actor.sync_model_to_rollout()
         actor_handle.wait()
         rollout_handle.wait()
+        self._rollout_weights_initialized = True
+
+    def _should_sync_rollout_weights(self, step: int) -> bool:
+        """Ensure rollout has valid weights before applying the sync cadence."""
+        return (
+            not self._rollout_weights_initialized
+            or step % self.weight_sync_interval == 0
+        )
 
     def evaluate(self):
         env_handle: Handle = self.env.evaluate(
@@ -496,7 +509,7 @@ class EmbodiedRunner:
 
             with self.timer("step", trace_args={"step_idx": _step}):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if self._should_sync_rollout_weights(_step):
                         self.update_rollout_weights()
                 with self.timer("generate_rollouts"):
                     env_handle: Handle = self.env.interact(
@@ -521,6 +534,10 @@ class EmbodiedRunner:
                     rollout_handle.wait()
                     if self.reward is not None:
                         reward_handle.wait()
+
+                if self.recompute_logprobs:
+                    with self.timer("recompute_logprobs"):
+                        self.actor.recompute_logprobs().wait()
 
                 # compute advantages and returns.
                 with self.timer("cal_adv_and_returns"):
@@ -580,7 +597,7 @@ class EmbodiedRunner:
 
             with self.timer("step", trace_args={"step_idx": _step}):
                 with self.timer("sync_weights"):
-                    if _step % self.weight_sync_interval == 0:
+                    if self._should_sync_rollout_weights(_step):
                         self.update_rollout_weights()
                 env_handle: Handle = self.env.interact(
                     input_channel=self.env_channel,
