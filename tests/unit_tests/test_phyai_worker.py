@@ -13,10 +13,8 @@
 # limitations under the License.
 
 import inspect
-import sys
-from types import ModuleType, SimpleNamespace
+from types import SimpleNamespace
 
-import numpy as np
 import pytest
 import torch
 from omegaconf import OmegaConf
@@ -29,7 +27,6 @@ from rlinf.hybrid_engines.weight_syncer.bucket_syncer import BucketWeightSyncer
 from rlinf.models.embodiment.openpi.modules.model import (
     IMAGE_KEYS,
     Observation,
-    preprocess_observation,
 )
 from rlinf.workers.rollout import utils as rollout_utils
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -170,7 +167,7 @@ def test_phyai_worker_rejects_unknown_plugin(monkeypatch):
 
 
 @pytest.mark.parametrize("only_eval", [False, True])
-def test_init_worker_loads_checkpoint_and_uses_fp32_vision_boundary(
+def test_init_worker_loads_checkpoint_and_builds_phyai_processors(
     monkeypatch, only_eval
 ):
     captured = {}
@@ -187,26 +184,18 @@ def test_init_worker_loads_checkpoint_and_uses_fp32_vision_boundary(
     monkeypatch.setattr(phyai_worker, "EngineArgs", SimpleNamespace)
     monkeypatch.setattr(phyai_worker, "Engine", _InitializedEngine)
 
-    def input_transform(sample):
-        return sample
-
-    def output_transform(sample):
-        return sample
-
-    def _build_transforms(model_path, config_name, data_kwargs=None):
-        captured["transforms"] = (model_path, config_name, data_kwargs)
-        return [input_transform], [output_transform]
-
-    openpi = ModuleType("openpi")
-    transforms = ModuleType("openpi.transforms")
-    transforms.compose = lambda functions: functions[0]
-    openpi.transforms = transforms
-    monkeypatch.setitem(sys.modules, "openpi", openpi)
-    monkeypatch.setitem(sys.modules, "openpi.transforms", transforms)
-    monkeypatch.setattr(phyai_worker, "build_openpi_transforms", _build_transforms)
+    processor = SimpleNamespace()
+    preprocessor = SimpleNamespace()
+    monkeypatch.setattr(
+        PhyAIWorker,
+        "_build_phyai_processors",
+        lambda *_args, **_kwargs: (processor, preprocessor),
+    )
 
     worker = object.__new__(PhyAIWorker)
     worker._engine = None
+    worker._processor = None
+    worker._phyai_preprocessor = None
     worker._phyai_plugin = "pi05"
     worker._phyai_cfg = OmegaConf.create({"params_dtype": "bf16"})
     worker.model_cfg = OmegaConf.create(
@@ -251,65 +240,59 @@ def test_init_worker_loads_checkpoint_and_uses_fp32_vision_boundary(
     assert plugin_cfg.critic_action_chunk is None
     assert plugin_cfg.add_value_head
     assert plugin_cfg.value_after_vlm
-    assert captured["transforms"] == ("/checkpoint", "pi05_libero", None)
-    assert worker._input_transform_fn is input_transform
-    assert worker._output_transform_fn is output_transform
+    assert worker._processor is processor
+    assert worker._phyai_preprocessor is preprocessor
 
 
-def test_phyai_preprocessing_builds_canonical_request():
-    def input_transform(sample):
-        base = np.asarray(sample["observation/image"], dtype=np.uint8)
-        wrist = np.asarray(sample["observation/wrist_image"], dtype=np.uint8)
-        state = np.asarray(sample["observation/state"], dtype=np.float64) / 10
-        prompt_length = min(len(sample["prompt"]), 8)
-        return {
-            "image": {
-                IMAGE_KEYS[0]: base,
-                IMAGE_KEYS[1]: wrist,
-                IMAGE_KEYS[2]: np.zeros_like(base),
-            },
-            "image_mask": {
-                IMAGE_KEYS[0]: np.bool_(True),
-                IMAGE_KEYS[1]: np.bool_(True),
-                IMAGE_KEYS[2]: np.bool_(False),
-            },
-            "state": state,
-            "tokenized_prompt": np.arange(8, dtype=np.int64),
-            "tokenized_prompt_mask": np.arange(8) < prompt_length,
-        }
+def test_phyai_preprocessing_builds_task_only_rollout_and_replay_inputs():
+    class _Processor:
+        def postprocess(self, actions):
+            return actions + 3
 
-    def output_transform(sample):
-        return {"actions": sample["actions"] + sample["state"][0]}
+    class _Preprocessor:
+        def __call__(self, raw):
+            assert len(raw["images"]) == 2
+            assert raw["prompt"] == ["pick cube\n", "place block\n"]
+            batch_size = raw["images"][0].shape[0]
+            return {
+                "pixel_values": torch.full(
+                    (batch_size, 2, 3, 224, 224),
+                    0.25,
+                    dtype=torch.bfloat16,
+                ),
+                "input_ids": torch.arange(8).expand(batch_size, -1),
+                "lang_lens": torch.full((batch_size,), 4, dtype=torch.int64),
+                "state": raw["state"].to(torch.bfloat16),
+            }
 
     env_obs = {
         "main_images": torch.randint(0, 256, (2, 224, 224, 3), dtype=torch.uint8),
         "wrist_images": torch.randint(0, 256, (2, 224, 224, 3), dtype=torch.uint8),
         "states": torch.randn(2, 8),
-        "task_descriptions": ["pick", "place"],
+        "task_descriptions": ["pick_cube", "place\nblock"],
     }
     worker = object.__new__(PhyAIWorker)
     worker._engine_device = torch.device("cpu")
+    worker._engine_dtype = torch.bfloat16
+    worker._processor = _Processor()
+    worker._phyai_preprocessor = _Preprocessor()
+    worker._phyai_cfg = OmegaConf.create({"normalize_pixels": True})
     worker._num_images = 2
-    worker._input_transform_fn = input_transform
-    worker._output_transform_fn = output_transform
-    worker._openpi_config_name = "pi05_libero"
     worker._state_indices = None
 
     request, replay = worker._build_request(env_obs)
-    transformed = worker._apply_input_transforms(worker._repack_env_obs(env_obs))
-    observation = worker._observation_to_device(transformed)
-    prepared = preprocess_observation(observation, train=False)
 
-    assert torch.equal(request.input_ids, observation.tokenized_prompt)
-    assert torch.equal(request.lang_lens, observation.tokenized_prompt_mask.sum(dim=-1))
-    assert torch.equal(replay.state, observation.state)
-    for index, key in enumerate(IMAGE_KEYS[:2]):
-        assert torch.equal(replay.images[key], prepared.images[key])
-        assert torch.equal(
-            request.pixel_values[:, index],
-            prepared.images[key].permute(0, 3, 1, 2),
-        )
-    assert request.pixel_values.dtype is torch.float32
+    assert request.pixel_values.dtype is torch.bfloat16
+    assert request.pixel_values.eq(0.25).all()
+    assert torch.equal(request.input_ids, torch.arange(8).expand(2, -1))
+    assert request.lang_lens.eq(4).all()
+    assert replay.state.dtype is torch.float32
+    assert torch.equal(replay.state, env_obs["states"].to(torch.bfloat16).float())
+    assert replay.images[IMAGE_KEYS[0]].dtype is torch.bfloat16
+    assert replay.images[IMAGE_KEYS[0]].eq(0.25).all()
+    assert replay.images[IMAGE_KEYS[2]].eq(0).all()
+    assert torch.equal(replay.tokenized_prompt, request.input_ids)
+    assert worker._processor.postprocess(torch.zeros(2, 10, 32)).eq(3).all()
 
 
 def test_training_predict_returns_actor_replay_contract(monkeypatch):
@@ -344,15 +327,16 @@ def test_training_predict_returns_actor_replay_contract(monkeypatch):
     worker._accelerator_type = "cpu"
     worker._timer_metrics = {}
     worker._engine = _Engine()
-    worker._input_transform_fn = lambda sample: sample
-    worker._repack_env_obs = lambda env_obs: env_obs
-    worker._apply_input_transforms = lambda _env_obs: {
-        "image_mask": processed.image_masks,
-        "tokenized_prompt": processed.tokenized_prompt,
-        "tokenized_prompt_mask": processed.tokenized_prompt_mask,
-    }
-    worker._observation_to_device = lambda _transformed: processed
-    worker._apply_output_transforms = lambda actions, _state: actions[:, :5, :7]
+    worker._processor = SimpleNamespace(postprocess=lambda actions: actions[:, :5, :7])
+    worker._phyai_preprocessor = SimpleNamespace()
+    worker._build_request = lambda _env_obs: (
+        SimpleNamespace(
+            pixel_values=torch.zeros(batch_size, 2, 3, 224, 224),
+            input_ids=processed.tokenized_prompt,
+            lang_lens=processed.tokenized_prompt_mask.sum(dim=-1),
+        ),
+        processed,
+    )
     worker._engine_device = torch.device("cpu")
     worker._num_images = 2
     worker._model_action_horizon = 10

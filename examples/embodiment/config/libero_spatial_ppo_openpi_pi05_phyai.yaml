@@ -112,6 +112,11 @@ rollout:
 
   phyai:
     plugin: pi05
+    tokenizer_name: ${oc.env:PHYAI_TOKENIZER_NAME,google/paligemma-3b-pt-224}
+    norm_stats_path: ${rollout.model.model_path}/physical-intelligence/libero/norm_stats.json
+    state_dim: 8
+    normalize_pixels: True
+    image_pad_value: 0.0
     # Override when the PhyAI source tree is mounted elsewhere.
     kernel_config: ${oc.env:PHYAI_KERNEL_CONFIG,/opt/src/phyai/examples/configs/kernel_policies/pi05/rlinf_bf16.yaml}
     max_batch_size: null
