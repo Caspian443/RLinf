@@ -143,7 +143,19 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
             self.offload_optimizer()
 
     def model_provider_func(self) -> nn.Module:
-        model = get_model(self.cfg.actor.model)
+        model_cfg = self.cfg.actor.model
+        if (
+            SupportedModel(model_cfg.model_type) == SupportedModel.OPENPI
+            and bool(model_cfg.get("add_value_head", False))
+        ):
+            # The base SFT checkpoint may not contain the RL value head. Seed
+            # only model construction so its initialization is reproducible
+            # without changing the Actor process's subsequent RNG stream.
+            with torch.random.fork_rng(devices=[]):
+                torch.manual_seed(int(self.cfg.actor.seed) + self._rank)
+                model = get_model(model_cfg)
+        else:
+            model = get_model(model_cfg)
         if model is None:
             model = super().model_provider_func()
 

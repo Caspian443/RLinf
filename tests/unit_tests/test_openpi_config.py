@@ -21,6 +21,7 @@ from hydra import compose, initialize_config_dir
 from omegaconf import OmegaConf
 
 from rlinf.config import validate_embodied_cfg
+from rlinf.workers.actor import embodied_fsdp_actor_worker
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
 from rlinf.workers.rollout import utils as rollout_utils
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
@@ -51,6 +52,42 @@ def test_phyai_training_requires_bucket_weight_sync(monkeypatch):
 
     with pytest.raises(AssertionError, match="weight_syncer.type='bucket'"):
         validate_embodied_cfg(cfg)
+
+
+def test_openpi_value_head_initialization_is_seeded_without_rng_side_effects(
+    monkeypatch,
+):
+    actor = object.__new__(EmbodiedFSDPActor)
+    actor.cfg = OmegaConf.create(
+        {
+            "actor": {
+                "seed": 42,
+                "model": {"model_type": "openpi", "add_value_head": True},
+            },
+            "runner": {"ckpt_path": None},
+        }
+    )
+    actor._rank = 0
+    monkeypatch.setattr(
+        embodied_fsdp_actor_worker,
+        "get_model",
+        lambda _cfg: torch.rand(4),
+    )
+
+    torch.manual_seed(7)
+    expected_before = torch.rand(1)
+    expected_after = torch.rand(1)
+    torch.manual_seed(7)
+    actual_before = torch.rand(1)
+    first = actor.model_provider_func()
+    actual_after = torch.rand(1)
+
+    torch.manual_seed(99)
+    second = actor.model_provider_func()
+
+    assert torch.equal(actual_before, expected_before)
+    assert torch.equal(actual_after, expected_after)
+    assert torch.equal(first, second)
 
 
 @pytest.mark.parametrize(
