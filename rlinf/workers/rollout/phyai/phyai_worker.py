@@ -339,7 +339,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 ),
                 DeviceStep(
                     device=self._engine_device,
-                    float_dtype=self._engine_dtype,
+                    float_dtype=torch.float32,
                 ),
             ]
         )
@@ -509,7 +509,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
     ) -> tuple[PI05Request, Observation]:
         assert self._engine_device is not None
         transformed = self._apply_phyai_preprocessor(env_obs)
-        pixel_values = transformed["pixel_values"]
+        pixel_values = transformed["pixel_values"].to(torch.float32)
         input_ids = transformed["input_ids"]
         lang_lens = transformed["lang_lens"]
         state = transformed["state"].to(torch.float32)

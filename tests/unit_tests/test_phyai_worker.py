@@ -258,11 +258,11 @@ def test_phyai_preprocessing_builds_task_only_rollout_and_replay_inputs():
                 "pixel_values": torch.full(
                     (batch_size, 2, 3, 224, 224),
                     0.25,
-                    dtype=torch.bfloat16,
+                    dtype=torch.float32,
                 ),
                 "input_ids": torch.arange(8).expand(batch_size, -1),
                 "lang_lens": torch.full((batch_size,), 4, dtype=torch.int64),
-                "state": raw["state"].to(torch.bfloat16),
+                "state": raw["state"].to(torch.float32),
             }
 
     env_obs = {
@@ -282,13 +282,13 @@ def test_phyai_preprocessing_builds_task_only_rollout_and_replay_inputs():
 
     request, replay = worker._build_request(env_obs)
 
-    assert request.pixel_values.dtype is torch.bfloat16
+    assert request.pixel_values.dtype is torch.float32
     assert request.pixel_values.eq(0.25).all()
     assert torch.equal(request.input_ids, torch.arange(8).expand(2, -1))
     assert request.lang_lens.eq(4).all()
     assert replay.state.dtype is torch.float32
-    assert torch.equal(replay.state, env_obs["states"].to(torch.bfloat16).float())
-    assert replay.images[IMAGE_KEYS[0]].dtype is torch.bfloat16
+    assert torch.equal(replay.state, env_obs["states"].float())
+    assert replay.images[IMAGE_KEYS[0]].dtype is torch.float32
     assert replay.images[IMAGE_KEYS[0]].eq(0.25).all()
     assert replay.images[IMAGE_KEYS[2]].eq(0).all()
     assert torch.equal(replay.tokenized_prompt, request.input_ids)
