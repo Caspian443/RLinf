@@ -15,10 +15,10 @@
 """PhyAI-backed embodied rollout worker."""
 
 import gc
+import json
 import math
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -34,7 +34,6 @@ from phyai.models.pi05.scheduler_pi05 import (
     PI05Request,
     PI05RolloutRequest,
 )
-from torch.utils._pytree import tree_map
 
 from rlinf.config import torch_dtype_from_precision
 from rlinf.hybrid_engines.weight_syncer.bucket_syncer import BucketWeightSyncer
@@ -42,18 +41,12 @@ from rlinf.models.embodiment.openpi import _resolve_action_horizon_and_chunk
 from rlinf.models.embodiment.openpi.modules.model import (
     IMAGE_KEYS,
     Observation,
-    preprocess_observation,
-)
-from rlinf.models.embodiment.openpi.transforms.pipeline import (
-    build_openpi_transforms,
 )
 from rlinf.scheduler import Worker
 from rlinf.utils.ckpt_convertor.openpi.openpi_to_openpi_pytorch import (
     new_to_old_state_dict,
 )
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
-
-_VISION_INPUT_DTYPE = torch.float32
 
 
 @dataclass(frozen=True)
@@ -115,9 +108,8 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self._phyai_cfg = cfg.rollout.get("phyai", {})
         self._phyai_plugin = str(self._phyai_cfg.get("plugin", "pi05")).lower()
         self._engine = None
-        self._input_transform_fn = None
-        self._output_transform_fn = None
-        self._openpi_config_name = ""
+        self._processor = None
+        self._phyai_preprocessor = None
         self._state_indices: list[int] | None = None
         self._weight_target = None
         self._engine_device: torch.device | None = None
@@ -146,7 +138,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
     # Configuration and engine setup.
 
     def init_worker(self) -> None:
-        """Construct one PhyAI engine and the shared OpenPI transforms."""
+        """Construct one PhyAI engine and its PI0.5 processors."""
         if self._engine is not None:
             raise RuntimeError("PhyAI engine is already initialized.")
         if str(self.model_cfg.get("model_type", "")) != "openpi":
@@ -205,24 +197,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 "Native OpenPI pi0.5 PPO parity currently requires exactly two "
                 f"real cameras; got num_images={num_images}."
             )
-        config_name = str(openpi_cfg.get("config_name", ""))
-        if not config_name:
-            raise ValueError(
-                "actor.model.openpi.config_name is required for PhyAI preprocessing."
-            )
-        data_kwargs = OmegaConf.select(self.model_cfg, "openpi_data", default=None)
-        if data_kwargs is not None:
-            data_kwargs = OmegaConf.to_container(data_kwargs, resolve=True)
-        input_transforms, output_transforms = build_openpi_transforms(
-            self.model_cfg.model_path,
-            config_name,
-            data_kwargs=data_kwargs,
-        )
-        from openpi.transforms import compose
-
-        self._input_transform_fn = compose(input_transforms)
-        self._output_transform_fn = compose(output_transforms)
-        self._openpi_config_name = config_name
         state_indices = openpi_cfg.get("state_indices")
         self._state_indices = list(state_indices) if state_indices else None
         vision_dtype = self._optional_dtype(
@@ -279,12 +253,100 @@ class PhyAIWorker(MultiStepRolloutWorker):
                 if value is not None:
                     os.environ[key] = value
 
+        try:
+            self._processor, self._phyai_preprocessor = self._build_phyai_processors(
+                plugin_cfg=plugin_cfg,
+                num_images=num_images,
+            )
+        except Exception:
+            engine.close()
+            raise
+
         self._engine = engine
         self._num_images = num_images
         self._model_action_horizon = int(plugin_cfg.chunk_size)
         self._model_action_dim = int(plugin_cfg.max_action_dim)
         self._num_steps = int(plugin_cfg.num_inference_steps)
         self._weight_target = _PhyAIWeightTarget(engine)
+
+    def _build_phyai_processors(
+        self, *, plugin_cfg: PI05Config, num_images: int
+    ) -> tuple[Any, Any]:
+        """Build the PhyAI action processor and task-only input pipeline."""
+        from phyai_utils_tools.models.pi05 import PI05Processor
+        from phyai_utils_tools.processing.pipeline import ProcessorPipeline
+        from phyai_utils_tools.processing.steps import (
+            DeviceStep,
+            FeatureType,
+            NormalizationMode,
+            NormalizeImageStep,
+            NormalizerStep,
+            ResizeWithPadStep,
+            TokenizerStep,
+        )
+
+        norm_stats_path = self._phyai_cfg.get("norm_stats_path")
+        tokenizer_name = self._phyai_cfg.get("tokenizer_name")
+        if not norm_stats_path or not tokenizer_name:
+            raise ValueError(
+                "PhyAI preprocessing requires rollout.phyai.norm_stats_path and "
+                "rollout.phyai.tokenizer_name."
+            )
+        state_dim = int(self._phyai_cfg.get("state_dim", 8))
+        dataset_stats = self._load_dataset_stats(norm_stats_path, state_dim)
+        processor = PI05Processor(
+            image_size=plugin_cfg.vision.image_size,
+            num_channels=plugin_cfg.vision.num_channels,
+            num_images=num_images,
+            tokenizer_max_length=plugin_cfg.tokenizer_max_length,
+            action_dim=int(self.model_cfg.action_dim),
+            tokenizer_name=str(tokenizer_name),
+            dataset_stats=dataset_stats,
+            normalize_pixels=bool(self._phyai_cfg.get("normalize_pixels", True)),
+            image_pad_value=float(self._phyai_cfg.get("image_pad_value", 0.0)),
+            device=self._engine_device,
+            params_dtype=self._engine_dtype,
+        )
+        steps = [
+            ResizeWithPadStep(
+                target_size=plugin_cfg.vision.image_size,
+                num_images=num_images,
+                num_channels=plugin_cfg.vision.num_channels,
+                pad_value=float(self._phyai_cfg.get("image_pad_value", 0.0)),
+            )
+        ]
+        if bool(self._phyai_cfg.get("normalize_pixels", True)):
+            steps.append(NormalizeImageStep())
+        steps.extend(
+            [
+                NormalizerStep(
+                    features={
+                        "observation.state": {
+                            "type": FeatureType.STATE.value,
+                            "shape": [],
+                        }
+                    },
+                    norm_map={
+                        FeatureType.STATE.value: NormalizationMode.QUANTILES.value
+                    },
+                    stats=dataset_stats,
+                    device=self._engine_device,
+                ),
+                TokenizerStep(
+                    tokenizer=processor.tokenizer,
+                    max_length=plugin_cfg.tokenizer_max_length,
+                    tokenizer_name=str(tokenizer_name),
+                ),
+                DeviceStep(
+                    device=self._engine_device,
+                    float_dtype=self._engine_dtype,
+                ),
+            ]
+        )
+        return processor, ProcessorPipeline(
+            steps=steps,
+            name="pi05_rlinf_task_only_preprocessor",
+        )
 
     @staticmethod
     def _build_plugin_config(model_cfg: Any) -> PI05Config:
@@ -342,7 +404,56 @@ class PhyAIWorker(MultiStepRolloutWorker):
         """Map the native wrapper prefix to PhyAI HF parameter names."""
         return name[len("model.") :] if name.startswith("model.") else name
 
-    # RLinf/OpenPI preprocessing remains local to this backend adapter.
+    @staticmethod
+    def _load_dataset_stats(
+        path: str | Path, state_dim: int
+    ) -> dict[str, dict[str, Any]]:
+        """Load the state/action quantile stats consumed by PI05Processor."""
+        with Path(path).open(encoding="utf-8") as stream:
+            payload = json.load(stream)
+        stats = payload.get("norm_stats", payload)
+        if "state" not in stats or "actions" not in stats:
+            raise ValueError(
+                f"OpenPI norm stats at {path} must contain state and actions."
+            )
+        state_stats = {
+            key: values[:state_dim] for key, values in stats["state"].items()
+        }
+        if any(len(values) < state_dim for values in state_stats.values()):
+            raise ValueError(
+                f"OpenPI state stats at {path} are shorter than state_dim={state_dim}."
+            )
+        return {
+            "observation.state": state_stats,
+            "action": stats["actions"],
+        }
+
+    # PhyAI preprocessing remains local to this backend adapter.
+
+    @staticmethod
+    def _camera_batches(value: Any, name: str) -> list[torch.Tensor]:
+        """Convert one RLinf camera field to a list of BCHW tensors."""
+        if value is None:
+            return []
+        if isinstance(value, (list, tuple)):
+            cameras = list(value)
+        elif isinstance(value, torch.Tensor) and value.ndim == 5:
+            cameras = [value[:, index] for index in range(value.shape[1])]
+        else:
+            cameras = [value]
+
+        normalized = []
+        for index, camera in enumerate(cameras):
+            camera = camera if torch.is_tensor(camera) else torch.as_tensor(camera)
+            if camera.ndim != 4:
+                raise ValueError(
+                    f"{name}[{index}] must be a 4-D image batch; got "
+                    f"shape={tuple(camera.shape)}."
+                )
+            if camera.shape[1] not in (1, 3, 4) and camera.shape[-1] in (1, 3, 4):
+                camera = camera.permute(0, 3, 1, 2).contiguous()
+            normalized.append(camera)
+        return normalized
 
     def _select_configured_state(self, states: Any) -> Any:
         indices = self._state_indices
@@ -360,121 +471,82 @@ class PhyAIWorker(MultiStepRolloutWorker):
             return states.index_select(-1, index)
         return np.asarray(states)[..., indices]
 
-    def _repack_env_obs(self, env_obs: dict[str, Any]) -> dict[str, Any]:
-        states = self._select_configured_state(env_obs["states"])
-        repacked = {
-            "observation/image": env_obs["main_images"],
-            "prompt": env_obs["task_descriptions"],
-        }
-        if "calvin" in self._openpi_config_name:
-            repacked["observation/state_ee_pos"] = states[:, :3]
-            repacked["observation/state_ee_rot"] = states[:, 3:6]
-            repacked["observation/state_gripper"] = states[:, 6:7]
-        else:
-            repacked["observation/state"] = states
-        if env_obs.get("wrist_images") is not None:
-            repacked["observation/wrist_image"] = env_obs["wrist_images"]
-        if env_obs.get("extra_view_images") is not None:
-            repacked["observation/extra_view_image"] = env_obs["extra_view_images"]
-        return repacked
-
-    def _apply_input_transforms(self, observation: dict[str, Any]) -> dict[str, Any]:
-        assert self._input_transform_fn is not None
-        prompts = observation["prompt"]
-        inputs = tree_map(
-            lambda value: (
-                np.asarray(value.detach().cpu()) if torch.is_tensor(value) else value
-            ),
-            {key: value for key, value in observation.items() if key != "prompt"},
-        )
-        batch_size = next(iter(inputs.values())).shape[0]
-        if isinstance(prompts, np.ndarray):
-            prompts = prompts.tolist()
-        samples = []
-        for index in range(batch_size):
-            sample = tree_map(lambda value: value[index], inputs)
-            sample["prompt"] = prompts[index]
-            samples.append(sample)
-        with ThreadPoolExecutor(max_workers=min(batch_size, 8)) as executor:
-            transformed = list(executor.map(self._input_transform_fn, samples))
-        return tree_map(
-            lambda *values: torch.from_numpy(np.asarray(values).copy()),
-            *transformed,
-        )
-
-    def _apply_output_transforms(
-        self, actions: torch.Tensor, state: torch.Tensor
-    ) -> torch.Tensor:
-        assert self._output_transform_fn is not None
-        transformed = []
-        for index in range(actions.shape[0]):
-            transformed.append(
-                self._output_transform_fn(
-                    {
-                        "actions": np.asarray(actions[index].detach().cpu()),
-                        "state": np.asarray(state[index].detach().cpu()),
-                    }
-                )["actions"]
-            )
-        return torch.from_numpy(np.asarray(transformed).copy())
-
-    def _observation_to_device(self, transformed: dict[str, Any]) -> Observation:
+    def _apply_phyai_preprocessor(self, env_obs: dict[str, Any]) -> dict[str, Any]:
+        assert self._phyai_preprocessor is not None
         assert self._engine_device is not None
-        observation = Observation.from_dict(transformed)
-
-        def move(value: Any, *, dtype: torch.dtype | None = None) -> Any:
-            if not torch.is_tensor(value):
-                return value
-            return value.to(device=self._engine_device, dtype=dtype)
-
-        return Observation(
-            images={key: move(value) for key, value in observation.images.items()},
-            image_masks={
-                key: move(value) for key, value in observation.image_masks.items()
-            },
-            state=move(observation.state, dtype=torch.float32),
-            tokenized_prompt=move(observation.tokenized_prompt),
-            tokenized_prompt_mask=move(observation.tokenized_prompt_mask),
-            token_ar_mask=move(observation.token_ar_mask),
-            token_loss_mask=move(observation.token_loss_mask),
-            pcd_xyz=move(observation.pcd_xyz),
+        images = self._camera_batches(env_obs.get("main_images"), "main_images")
+        images.extend(self._camera_batches(env_obs.get("wrist_images"), "wrist_images"))
+        images.extend(
+            self._camera_batches(env_obs.get("extra_view_images"), "extra_view_images")
+        )
+        if bool(self._phyai_cfg.get("normalize_pixels", True)):
+            images = [
+                image.float().div(255.0) if image.dtype == torch.uint8 else image
+                for image in images
+            ]
+        tasks = env_obs["task_descriptions"]
+        if isinstance(tasks, np.ndarray):
+            tasks = tasks.tolist()
+        if isinstance(tasks, str):
+            tasks = [tasks]
+        prompts = [
+            f"{task.strip().replace('_', ' ').replace(chr(10), ' ')}\n"
+            for task in tasks
+        ]
+        states = self._select_configured_state(env_obs["states"])
+        if not torch.is_tensor(states):
+            states = torch.as_tensor(states)
+        return self._phyai_preprocessor(
+            {
+                "images": images,
+                "prompt": prompts,
+                "state": states.to(device=self._engine_device),
+            }
         )
 
     def _build_request(
         self, env_obs: dict[str, Any]
     ) -> tuple[PI05Request, Observation]:
         assert self._engine_device is not None
-        transformed = self._apply_input_transforms(self._repack_env_obs(env_obs))
-        image_keys = IMAGE_KEYS[: self._num_images]
-        for key in image_keys:
-            if not bool(transformed["image_mask"][key].all()):
-                raise ValueError(
-                    f"PhyAI cannot omit masked image tokens for input {key!r}."
-                )
-        token_mask = transformed.get("tokenized_prompt_mask")
-        if token_mask is None or transformed.get("tokenized_prompt") is None:
-            raise RuntimeError("OpenPI preprocessing did not produce prompt tokens.")
-        lang_lens = token_mask.sum(dim=-1, dtype=torch.int64)
-        expected_mask = torch.arange(token_mask.shape[-1])[None, :] < lang_lens[:, None]
-        if not torch.equal(token_mask, expected_mask):
-            raise ValueError("PhyAI requires right-padded OpenPI prompt tokens.")
-
-        processed = self._observation_to_device(transformed)
-        processed = preprocess_observation(processed, train=False)
-        pixel_values = torch.stack(
-            [processed.images[key].permute(0, 3, 1, 2) for key in image_keys],
-            dim=1,
-        ).to(device=self._engine_device, dtype=_VISION_INPUT_DTYPE)
-
-        input_ids = processed.tokenized_prompt
-        input_ids = input_ids.to(device=self._engine_device)
-
-        request = PI05Request(
-            pixel_values=pixel_values.contiguous(),
-            input_ids=input_ids.contiguous(),
-            lang_lens=lang_lens.to(device=self._engine_device).contiguous(),
+        transformed = self._apply_phyai_preprocessor(env_obs)
+        pixel_values = transformed["pixel_values"]
+        input_ids = transformed["input_ids"]
+        lang_lens = transformed["lang_lens"]
+        state = transformed["state"].to(torch.float32)
+        token_mask = (
+            torch.arange(input_ids.shape[-1], device=self._engine_device)[None, :]
+            < lang_lens[:, None]
         )
-        return request, processed
+        batch_size = pixel_values.shape[0]
+        image_keys = IMAGE_KEYS[: self._num_images]
+        replay_images = {
+            key: pixel_values[:, index].permute(0, 2, 3, 1).contiguous()
+            for index, key in enumerate(image_keys)
+        }
+        replay_masks = {
+            key: torch.ones(batch_size, dtype=torch.bool, device=self._engine_device)
+            for key in image_keys
+        }
+        for key in IMAGE_KEYS[self._num_images :]:
+            replay_images[key] = torch.zeros_like(replay_images[image_keys[0]])
+            replay_masks[key] = torch.zeros(
+                batch_size, dtype=torch.bool, device=self._engine_device
+            )
+        processed = Observation(
+            images=replay_images,
+            image_masks=replay_masks,
+            state=state,
+            tokenized_prompt=input_ids,
+            tokenized_prompt_mask=token_mask,
+        )
+        return (
+            PI05Request(
+                pixel_values=pixel_values.contiguous(),
+                input_ids=input_ids.contiguous(),
+                lang_lens=lang_lens.contiguous(),
+            ),
+            processed,
+        )
 
     # RLinf decides the transition distribution; PhyAI executes it.
 
@@ -654,12 +726,12 @@ class PhyAIWorker(MultiStepRolloutWorker):
     ) -> dict[str, torch.Tensor]:
         """Build the preprocessed replay contract consumed by openpi."""
         if processed.state is None:
-            raise RuntimeError("OpenPI preprocessing did not produce normalized state.")
+            raise RuntimeError("PhyAI preprocessing did not produce normalized state.")
         if (
             processed.tokenized_prompt is None
             or processed.tokenized_prompt_mask is None
         ):
-            raise RuntimeError("OpenPI preprocessing did not produce prompt tokens.")
+            raise RuntimeError("PhyAI preprocessing did not produce prompt tokens.")
 
         batch_size = int(processed.state.shape[0])
         token_ids = processed.tokenized_prompt.to(device=self._engine_device)
@@ -707,7 +779,7 @@ class PhyAIWorker(MultiStepRolloutWorker):
             raise ValueError(f"Unsupported PhyAI rollout mode: {mode!r}.")
         if mode == "train" and self.only_eval:
             raise RuntimeError("An evaluation-only PhyAI worker cannot run train mode.")
-        if self._engine is None or self._input_transform_fn is None:
+        if self._engine is None:
             raise RuntimeError("init_worker() must be called before PhyAI inference.")
 
         request, processed = self._build_request(env_obs)
@@ -719,7 +791,10 @@ class PhyAIWorker(MultiStepRolloutWorker):
             model_actions = rollout_result.actions
         else:
             model_actions = self._engine.step(request)
-        actions = self._apply_output_transforms(model_actions, processed.state)
+        assert self._processor is not None
+        actions = self._processor.postprocess(model_actions)
+        if not torch.is_tensor(actions):
+            actions = torch.as_tensor(actions)
         requested_chunks = int(self.model_cfg.num_action_chunks)
         if actions.shape[1] < requested_chunks:
             raise ValueError(
@@ -854,6 +929,6 @@ class PhyAIWorker(MultiStepRolloutWorker):
         self.log_info(f"Shutting down PhyAI engine on rollout rank {self._rank}.")
         self._engine.close()
         self._engine = None
+        self._processor = None
+        self._phyai_preprocessor = None
         self._weight_target = None
-        self._input_transform_fn = None
-        self._output_transform_fn = None
