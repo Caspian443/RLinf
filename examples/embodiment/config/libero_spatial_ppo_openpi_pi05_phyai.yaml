@@ -101,7 +101,7 @@ rollout:
   pipeline_stage_num: 1
 
   model:
-    model_path: "/path/to/model/RLinf-Pi05-LIBERO-SFT" # https://huggingface.co/RLinf/RLinf-Pi05-LIBERO-SFT
+    model_path: ${actor.model.model_path}
     precision: ${actor.model.precision}
     model_type: ${actor.model.model_type}
     num_action_chunks: ${actor.model.num_action_chunks}
@@ -112,8 +112,7 @@ rollout:
 
   phyai:
     plugin: pi05
-    # Override when the PhyAI source tree is mounted elsewhere.
-    kernel_config: ${oc.env:PHYAI_KERNEL_CONFIG,/opt/src/phyai/examples/configs/kernel_policies/pi05/rlinf_bf16.yaml}
+    kernel_config: ${oc.env:PHYAI_KERNEL_CONFIG,${oc.env:EMBODIED_PATH}/kernel_policies/phyai/rlinf_bf16.yaml}
     max_batch_size: null
     vision_params_dtype: null
     use_cuda_graph: True
