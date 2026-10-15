@@ -102,6 +102,39 @@ The following first provides an example configuration for an embodied task:
 
       huber_delta: 10.0         # Delta parameter for Huber loss in value training
 
+PhyAI PI0.5 rollout backend
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+Install RLinf, OpenPI, LIBERO, and the PhyAI rollout backend in the same virtual
+environment:
+
+.. code-block:: bash
+
+   bash requirements/install.sh \
+     --python 3.12 \
+     --torch 2.11.0 \
+     --install-rlinf \
+     embodied \
+     --model openpi \
+     --env libero \
+     --rollout-backend phyai
+
+The PhyAI packages are installed with ``--no-deps``. RLinf therefore retains the
+Torch and Transformers versions installed for OpenPI while installing the
+additional, validated runtime dependencies from
+``requirements/embodied/backends/phyai.txt``. Until a fixed PhyAI release is
+available, the installer builds the ``phyai`` wheel from the pinned Caspian
+revision; no PhyAI source checkout or editable installation is required.
+
+Download the PI0.5 checkpoint and set ``actor.model.model_path`` in
+``examples/embodiment/config/libero_spatial_ppo_openpi_pi05_phyai.yaml``. The
+rollout model reuses that value. Then start the example with:
+
+.. code-block:: bash
+
+   bash examples/embodiment/run_embodiment.sh \
+     libero_spatial_ppo_openpi_pi05_phyai
+
 When rollout generation and actor training use different inference implementations,
 their action log probabilities may differ even after synchronizing the same weights.
 Synchronous embodied PPO can replay the sampled transitions with the actor and apply
