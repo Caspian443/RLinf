@@ -109,6 +109,7 @@ rollout:
     num_steps: ${actor.model.num_steps}
     add_value_head: ${actor.model.add_value_head}
     openpi: ${actor.model.openpi}
+    openpi_data: ${actor.model.openpi_data}
 
   phyai:
     plugin: pi05
@@ -154,6 +155,10 @@ actor:
       noise_level: 0.5
       noise_method: "flow_sde"
       train_expert_only: True
+    # Keep actor preprocessing and PhyAI rollout preprocessing on the same
+    # checkpoint statistics. The public LIBERO checkpoint includes this file.
+    openpi_data:
+      norm_stats_path: ${actor.model.model_path}/physical-intelligence/libero/norm_stats.json
 
   optim:
     lr: 5.0e-6

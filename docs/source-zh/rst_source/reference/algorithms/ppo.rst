@@ -127,7 +127,9 @@ Torch 和 Transformers 版本，并从
 
 下载 PI0.5 checkpoint，并在
 ``examples/embodiment/config/libero_spatial_ppo_openpi_pi05_phyai.yaml`` 中设置
-``actor.model.model_path``。rollout model 会复用该路径。然后运行：
+``actor.model.model_path``。示例会读取 checkpoint 内的
+``physical-intelligence/libero/norm_stats.json``，rollout model 会复用权重和
+归一化统计。然后运行：
 
 .. code-block:: bash
 

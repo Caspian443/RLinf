@@ -128,7 +128,9 @@ revision; no PhyAI source checkout or editable installation is required.
 
 Download the PI0.5 checkpoint and set ``actor.model.model_path`` in
 ``examples/embodiment/config/libero_spatial_ppo_openpi_pi05_phyai.yaml``. The
-rollout model reuses that value. Then start the example with:
+example reads its bundled
+``physical-intelligence/libero/norm_stats.json`` and reuses both the checkpoint
+and statistics for rollout. Then start the example with:
 
 .. code-block:: bash
 
