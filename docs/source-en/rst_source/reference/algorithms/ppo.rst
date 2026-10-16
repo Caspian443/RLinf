@@ -123,9 +123,9 @@ The PhyAI packages are installed with ``--no-deps``. RLinf therefore retains the
 Torch and Transformers versions installed for OpenPI while installing the
 additional, validated runtime dependencies from
 ``requirements/embodied/backends/phyai.txt``. The three PhyAI packages are
-installed from the official PhyAI wheel index at the E2E-validated version
-``0.1.1.dev20261016``; no PhyAI source checkout or editable installation is
-required.
+installed from the official PhyAI wheel index using the latest version in the
+``0.1.1`` release line, including prereleases. No PhyAI source checkout or
+editable installation is required.
 
 Download the PI0.5 checkpoint and set ``actor.model.model_path`` in
 ``examples/embodiment/config/libero_spatial_ppo_openpi_pi05_phyai.yaml``. The

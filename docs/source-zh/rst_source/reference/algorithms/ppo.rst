@@ -122,8 +122,8 @@ PhyAI PI0.5 rollout backend
 PhyAI 包使用 ``--no-deps`` 安装，因此 RLinf 会保留 OpenPI 已安装的
 Torch 和 Transformers 版本，并从
 ``requirements/embodied/backends/phyai.txt`` 安装经验证的额外运行时依赖。
-三个 PhyAI 包会从官方 PhyAI wheel index 安装，并锁定到已经通过 E2E 验证的
-``0.1.1.dev20261016``；用户不需要 clone PhyAI 源码或执行 editable install。
+三个 PhyAI 包会从官方 PhyAI wheel index 安装，并选择 ``0.1.1`` 发布线中的
+最新版本（包括预发布版本）；用户不需要 clone PhyAI 源码或执行 editable install。
 
 下载 PI0.5 checkpoint，并在
 ``examples/embodiment/config/libero_spatial_ppo_openpi_pi05_phyai.yaml`` 中设置

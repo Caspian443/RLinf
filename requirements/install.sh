@@ -2404,7 +2404,7 @@ EOF
 }
 
 install_phyai_runtime() {
-    local phyai_version="0.1.1.dev20261016"
+    local phyai_version_spec=">=0.1.1.dev0,<0.1.2"
     local torch_before transformers_before
     read -r torch_before transformers_before < <(python - <<'PYEOF'
 import torch
@@ -2416,9 +2416,9 @@ PYEOF
 
     uv pip install -r "$SCRIPT_DIR/embodied/backends/phyai.txt"
     uv pip install --no-deps \
-        "phyai==${phyai_version}" \
-        "phyai-kernel==${phyai_version}" \
-        "phyai-ext==${phyai_version}" \
+        "phyai${phyai_version_spec}" \
+        "phyai-kernel${phyai_version_spec}" \
+        "phyai-ext${phyai_version_spec}" \
         --index https://mingti-org.github.io/phyai/simple/ \
         --prerelease=allow
 
