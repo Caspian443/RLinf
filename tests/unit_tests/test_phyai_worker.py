@@ -31,6 +31,7 @@ from rlinf.models.embodiment.openpi.modules.model import (
     Observation,
     preprocess_observation,
 )
+from rlinf.scheduler import Worker
 from rlinf.workers.rollout import utils as rollout_utils
 from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 from rlinf.workers.rollout.phyai import phyai_worker
@@ -128,6 +129,12 @@ def test_embodied_rollout_backend_selection():
     assert rollout_utils.get_embodied_rollout_worker(phyai_cfg) is PhyAIWorker
 
 
+def test_phyai_worker_owns_backend_lifecycle():
+    assert PhyAIWorker.__bases__ == (Worker,)
+    assert "generate" in PhyAIWorker.__dict__
+    assert "evaluate" in PhyAIWorker.__dict__
+
+
 def test_phyai_weight_target_converts_actor_layout():
     engine = _FakeEngine()
     target = _PhyAIWeightTarget(engine)
@@ -158,11 +165,7 @@ def test_phyai_weight_target_converts_actor_layout():
 
 
 def test_phyai_worker_rejects_unknown_plugin(monkeypatch):
-    def _init_base(worker, _cfg):
-        worker.enable_offload = False
-        worker.global_accelerator_ids = [0]
-
-    monkeypatch.setattr(MultiStepRolloutWorker, "__init__", _init_base)
+    monkeypatch.setattr(Worker, "__init__", lambda _worker: None)
     cfg = OmegaConf.create({"rollout": {"phyai": {"plugin": "unknown"}}})
 
     with pytest.raises(NotImplementedError, match="pi05"):
