@@ -2404,7 +2404,7 @@ EOF
 }
 
 install_phyai_runtime() {
-    local phyai_package_spec="${PHYAI_PACKAGE_SPEC:-phyai @ git+https://github.com/Caspian443/phyai.git@443ce8afc11809ce96ea0f76e0296815ff808ea9#subdirectory=phyai}"
+    local phyai_version="0.1.1.dev20261016"
     local torch_before transformers_before
     read -r torch_before transformers_before < <(python - <<'PYEOF'
 import torch
@@ -2416,10 +2416,10 @@ PYEOF
 
     uv pip install -r "$SCRIPT_DIR/embodied/backends/phyai.txt"
     uv pip install --no-deps \
-        "$phyai_package_spec" \
-        "phyai-kernel==0.1.1.dev20261010" \
-        "phyai-ext==0.1.1.dev20261010" \
-        --extra-index-url https://mingti-org.github.io/phyai/simple/ \
+        "phyai==${phyai_version}" \
+        "phyai-kernel==${phyai_version}" \
+        "phyai-ext==${phyai_version}" \
+        --index https://mingti-org.github.io/phyai/simple/ \
         --prerelease=allow
 
     # CUTLASS ships CUDA 12 and CUDA 13 runtime libraries in the cu13 extra.

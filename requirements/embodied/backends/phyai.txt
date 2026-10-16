@@ -12,7 +12,7 @@ torch-c-dlpack-ext==0.1.5
 pyarrow==19.0.1
 
 # Versions below are the CUDA 13 FlashInfer closure validated with
-# Python 3.12, Torch 2.11.0+cu130, and Transformers 4.53.2.
+# Python 3.12, Torch 2.11.0, and Transformers 4.53.2.
 flashinfer-python[cu13]==0.6.17
 nvidia-cudnn-frontend==1.28.0
 nvidia-cutlass-dsl[cu13]==4.7.1
