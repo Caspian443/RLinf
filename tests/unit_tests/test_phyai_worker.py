@@ -125,6 +125,57 @@ def test_phyai_worker_owns_backend_lifecycle():
     assert "evaluate" in PhyAIWorker.__dict__
 
 
+@pytest.mark.asyncio
+async def test_evaluate_preserves_channel_contract():
+    class _AsyncResult:
+        def __init__(self, value):
+            self.value = value
+
+        async def async_wait(self):
+            return self.value
+
+    worker = object.__new__(PhyAIWorker)
+    worker.cfg = OmegaConf.create({"env": {"group_name": "env"}})
+    worker.eval_rollout_epoch = 1
+    worker.n_eval_chunk_steps = 1
+    worker.num_pipeline_stages = 2
+    worker.eval_batch_size = 2
+    worker._rank = 0
+
+    recv_calls = []
+    send_calls = []
+    predict_calls = []
+
+    def recv_from(**kwargs):
+        recv_calls.append(kwargs)
+        stage_id = kwargs["route_key"]
+        return _AsyncResult({"obs": {"stage": stage_id}})
+
+    def predict(obs, mode):
+        predict_calls.append((obs, mode))
+        return torch.full((2, 1, 1), obs["stage"], device="cpu"), {}
+
+    worker.recv_from = recv_from
+    worker.predict = predict
+    worker.send_to = lambda **kwargs: send_calls.append(kwargs)
+
+    await inspect.unwrap(PhyAIWorker.evaluate)(worker, "input", "output")
+
+    assert [call["route_key"] for call in recv_calls] == [0, 1]
+    assert all(call["group_name"] == "env" for call in recv_calls)
+    assert all(call["channel"] == "input" for call in recv_calls)
+    assert all(call["tag"] == "eval_rollout_results" for call in recv_calls)
+    assert all(call["batch_size"] == 2 for call in recv_calls)
+    assert predict_calls == [({"stage": 0}, "eval"), ({"stage": 1}, "eval")]
+    assert [call["route_key"] for call in send_calls] == [0, 1]
+    assert all(call["group_name"] == "env" for call in send_calls)
+    assert all(call["channel"] == "output" for call in send_calls)
+    assert all(call["tag"] == "eval_rollout_results" for call in send_calls)
+    assert all(call["batch_size"] == 2 for call in send_calls)
+    assert all(call["data"].device.type == "cpu" for call in send_calls)
+    assert all(call["data"].is_contiguous() for call in send_calls)
+
+
 def test_phyai_weight_target_converts_actor_layout():
     engine = _FakeEngine()
     target = _PhyAIWeightTarget(engine)
