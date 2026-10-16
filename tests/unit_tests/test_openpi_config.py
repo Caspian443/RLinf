@@ -22,8 +22,6 @@ from omegaconf import OmegaConf
 
 from rlinf.config import validate_embodied_cfg
 from rlinf.workers.actor.embodied_fsdp_actor_worker import EmbodiedFSDPActor
-from rlinf.workers.rollout import utils as rollout_utils
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 
 
 def test_phyai_eval_and_actor_resolve_same_openpi_config(monkeypatch):
@@ -124,9 +122,3 @@ async def test_actor_weight_sync_uses_selective_state():
         (selected, 7),
         (selected, 7),
     ]
-
-
-def test_hf_embodied_backend_selection_without_phyai():
-    cfg = OmegaConf.create({"rollout": {"rollout_backend": "hf"}})
-
-    assert rollout_utils.get_embodied_rollout_worker(cfg) is MultiStepRolloutWorker

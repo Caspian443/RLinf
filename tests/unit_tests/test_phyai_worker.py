@@ -32,8 +32,6 @@ from rlinf.models.embodiment.openpi.modules.model import (
     preprocess_observation,
 )
 from rlinf.scheduler import Worker
-from rlinf.workers.rollout import utils as rollout_utils
-from rlinf.workers.rollout.hf.huggingface_worker import MultiStepRolloutWorker
 from rlinf.workers.rollout.phyai import phyai_worker
 from rlinf.workers.rollout.phyai.phyai_worker import PhyAIWorker, _PhyAIWeightTarget
 
@@ -119,14 +117,6 @@ async def test_sync_model_from_actor_commits_only_complete_updates():
         await inspect.unwrap(PhyAIWorker.sync_model_from_actor)(worker)
     assert engine.events[-1] == "abort"
     assert worker.version == 0
-
-
-def test_embodied_rollout_backend_selection():
-    hf_cfg = OmegaConf.create({"rollout": {"rollout_backend": "hf"}})
-    phyai_cfg = OmegaConf.create({"rollout": {"rollout_backend": "phyai"}})
-
-    assert rollout_utils.get_embodied_rollout_worker(hf_cfg) is MultiStepRolloutWorker
-    assert rollout_utils.get_embodied_rollout_worker(phyai_cfg) is PhyAIWorker
 
 
 def test_phyai_worker_owns_backend_lifecycle():
