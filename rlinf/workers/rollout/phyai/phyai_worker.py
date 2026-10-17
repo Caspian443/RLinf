@@ -133,7 +133,6 @@ class PhyAIWorker(Worker):
             )
 
         self.cfg = cfg
-        self.should_stop = False
         self.only_eval = bool(cfg.runner.get("only_eval", False))
         self.model_cfg = cfg.rollout.model if self.only_eval else cfg.actor.model
         self.actor_group_name = (
@@ -209,7 +208,6 @@ class PhyAIWorker(Worker):
         self._state_indices: list[int] | None = None
         self._weight_target = None
         self._engine_device: torch.device | None = None
-        self._engine_dtype: torch.dtype | None = None
         self._num_images = 0
         self._model_action_horizon = 0
         self._model_action_dim = 0
@@ -251,7 +249,6 @@ class PhyAIWorker(Worker):
             raise ValueError(
                 f"Unsupported PhyAI model precision: {engine_precision!r}."
             )
-        self._engine_dtype = dtype
         self._engine_device = torch.device(self.torch_device_type)
 
         runtime_cfg = self._phyai_cfg.get("runtime", {})
@@ -354,7 +351,7 @@ class PhyAIWorker(Worker):
                     config=EngineConfig(
                         device=DeviceConfig(
                             target=str(self._engine_device),
-                            params_dtype=self._engine_dtype,
+                            params_dtype=dtype,
                         ),
                         kernel=kernel_cfg,
                         runtime=RuntimeConfig(**runtime_values),
@@ -429,7 +426,7 @@ class PhyAIWorker(Worker):
         """Map the native wrapper prefix to PhyAI HF parameter names."""
         return name[len("model.") :] if name.startswith("model.") else name
 
-    # RLinf/OpenPI preprocessing remains local to this backend adapter.
+    # Backend-local adapters around shared RLinf/OpenPI transforms.
 
     def _select_configured_state(self, states: Any) -> Any:
         indices = self._state_indices

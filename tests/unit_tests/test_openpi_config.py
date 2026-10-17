@@ -56,6 +56,46 @@ def test_phyai_training_requires_bucket_weight_sync(monkeypatch):
 @pytest.mark.parametrize(
     ("path", "value", "message"),
     [
+        (
+            "algorithm.loss_type",
+            "embodied_dagger",
+            "does not support algorithm.loss_type='embodied_dagger'",
+        ),
+        (
+            "algorithm.loss_type",
+            "rlt_ac",
+            "does not support algorithm.loss_type='rlt_ac'",
+        ),
+        (
+            "algorithm.loss_type",
+            "rlt_td3",
+            "does not support algorithm.loss_type='rlt_td3'",
+        ),
+        (
+            "algorithm.adv_type",
+            "opd",
+            "does not support algorithm.adv_type='opd'",
+        ),
+    ],
+)
+def test_phyai_training_rejects_unsupported_algorithms(
+    monkeypatch, path, value, message
+):
+    config_dir = Path(__file__).resolve().parents[2] / "examples/embodiment/config"
+    monkeypatch.setenv("EMBODIED_PATH", str(config_dir.parent))
+    with initialize_config_dir(config_dir=str(config_dir), version_base=None):
+        cfg = compose(config_name="libero_spatial_ppo_openpi_pi05_phyai")
+    if path == "algorithm.adv_type":
+        cfg.algorithm.recompute_logprobs = False
+    OmegaConf.update(cfg, path, value)
+
+    with pytest.raises(AssertionError, match=message):
+        validate_embodied_cfg(cfg)
+
+
+@pytest.mark.parametrize(
+    ("path", "value", "message"),
+    [
         ("actor.model.add_value_head", False, "add_value_head=True"),
         ("actor.model.openpi.value_after_vlm", False, "value_after_vlm=True"),
         ("actor.model.openpi.value_vlm_mode", "last_token", "mean_token"),

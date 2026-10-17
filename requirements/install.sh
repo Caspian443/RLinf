@@ -2431,6 +2431,7 @@ PYEOF
 
     python - "$torch_before" "$transformers_before" <<'PYEOF'
 import sys
+from importlib.metadata import version
 
 import torch
 import transformers
@@ -2451,7 +2452,9 @@ if transformers.__version__ != expected_transformers:
 assert all((Engine, EngineArgs, PI05Args, PI05Request, PI05RolloutRequest))
 print(
     "[install.sh] PhyAI import smoke passed; "
-    f"torch={torch.__version__}, transformers={transformers.__version__}."
+    f"phyai={version('phyai')}, phyai-kernel={version('phyai-kernel')}, "
+    f"phyai-ext={version('phyai-ext')}, torch={torch.__version__}, "
+    f"transformers={transformers.__version__}."
 )
 PYEOF
 }
