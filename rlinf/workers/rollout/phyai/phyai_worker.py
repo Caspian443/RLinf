@@ -18,7 +18,6 @@ import gc
 import math
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
@@ -34,7 +33,6 @@ from phyai.models.pi05.scheduler_pi05 import (
     PI05Request,
     PI05RolloutRequest,
 )
-from torch.utils._pytree import tree_map
 from tqdm import tqdm
 
 from rlinf.config import torch_dtype_from_precision
@@ -53,6 +51,11 @@ from rlinf.models.embodiment.openpi.modules.model import (
     Observation,
     preprocess_observation,
 )
+from rlinf.models.embodiment.openpi.transforms.apply import (
+    apply_input_transform,
+    apply_output_transform,
+)
+from rlinf.models.embodiment.openpi.transforms.env import repack_env_obs
 from rlinf.models.embodiment.openpi.transforms.pipeline import (
     build_openpi_transforms,
 )
@@ -138,7 +141,6 @@ class PhyAIWorker(Worker):
             if cfg.get("actor", None) is not None
             else None
         )
-        self.device = self.torch_platform.current_device()
         self.num_pipeline_stages = int(cfg.rollout.pipeline_stage_num)
         self.enable_offload = bool(cfg.rollout.get("enable_offload", False))
         self.placement = HybridComponentPlacement(cfg, Cluster())
@@ -188,9 +190,7 @@ class PhyAIWorker(Worker):
         )
         self.collect_transitions = bool(cfg.rollout.get("collect_transitions", False))
         self.collect_prev_infos = bool(cfg.rollout.get("collect_prev_infos", True))
-        self.collect_final_values = bool(cfg.rollout.get("collect_final_values", True))
         self.version = 0
-        self.global_step = 0
         self.finished_episodes = None
 
         self.weight_syncer = None
@@ -447,64 +447,6 @@ class PhyAIWorker(Worker):
             return states.index_select(-1, index)
         return np.asarray(states)[..., indices]
 
-    def _repack_env_obs(self, env_obs: dict[str, Any]) -> dict[str, Any]:
-        states = self._select_configured_state(env_obs["states"])
-        repacked = {
-            "observation/image": env_obs["main_images"],
-            "prompt": env_obs["task_descriptions"],
-        }
-        if "calvin" in self._openpi_config_name:
-            repacked["observation/state_ee_pos"] = states[:, :3]
-            repacked["observation/state_ee_rot"] = states[:, 3:6]
-            repacked["observation/state_gripper"] = states[:, 6:7]
-        else:
-            repacked["observation/state"] = states
-        if env_obs.get("wrist_images") is not None:
-            repacked["observation/wrist_image"] = env_obs["wrist_images"]
-        if env_obs.get("extra_view_images") is not None:
-            repacked["observation/extra_view_image"] = env_obs["extra_view_images"]
-        return repacked
-
-    def _apply_input_transforms(self, observation: dict[str, Any]) -> dict[str, Any]:
-        assert self._input_transform_fn is not None
-        prompts = observation["prompt"]
-        inputs = tree_map(
-            lambda value: (
-                np.asarray(value.detach().cpu()) if torch.is_tensor(value) else value
-            ),
-            {key: value for key, value in observation.items() if key != "prompt"},
-        )
-        batch_size = next(iter(inputs.values())).shape[0]
-        if isinstance(prompts, np.ndarray):
-            prompts = prompts.tolist()
-        samples = []
-        for index in range(batch_size):
-            sample = tree_map(lambda value: value[index], inputs)
-            sample["prompt"] = prompts[index]
-            samples.append(sample)
-        with ThreadPoolExecutor(max_workers=min(batch_size, 8)) as executor:
-            transformed = list(executor.map(self._input_transform_fn, samples))
-        return tree_map(
-            lambda *values: torch.from_numpy(np.asarray(values).copy()),
-            *transformed,
-        )
-
-    def _apply_output_transforms(
-        self, actions: torch.Tensor, state: torch.Tensor
-    ) -> torch.Tensor:
-        assert self._output_transform_fn is not None
-        transformed = []
-        for index in range(actions.shape[0]):
-            transformed.append(
-                self._output_transform_fn(
-                    {
-                        "actions": np.asarray(actions[index].detach().cpu()),
-                        "state": np.asarray(state[index].detach().cpu()),
-                    }
-                )["actions"]
-            )
-        return torch.from_numpy(np.asarray(transformed).copy())
-
     def _observation_to_device(self, transformed: dict[str, Any]) -> Observation:
         assert self._engine_device is not None
         observation = Observation.from_dict(transformed)
@@ -531,7 +473,13 @@ class PhyAIWorker(Worker):
         self, env_obs: dict[str, Any]
     ) -> tuple[PI05Request, Observation]:
         assert self._engine_device is not None
-        transformed = self._apply_input_transforms(self._repack_env_obs(env_obs))
+        assert self._input_transform_fn is not None
+        repacked = repack_env_obs(
+            self._openpi_config_name,
+            env_obs,
+            select_state=self._select_configured_state,
+        )
+        transformed = apply_input_transform(self._input_transform_fn, repacked)
         image_keys = IMAGE_KEYS[: self._num_images]
         for key in image_keys:
             if not bool(transformed["image_mask"][key].all()):
@@ -806,7 +754,11 @@ class PhyAIWorker(Worker):
             model_actions = rollout_result.actions
         else:
             model_actions = self._engine.step(request)
-        actions = self._apply_output_transforms(model_actions, processed.state)
+        assert self._output_transform_fn is not None
+        actions = apply_output_transform(
+            self._output_transform_fn,
+            {"actions": model_actions, "state": processed.state},
+        )["actions"]
         requested_chunks = int(self.model_cfg.num_action_chunks)
         if actions.shape[1] < requested_chunks:
             raise ValueError(
@@ -845,34 +797,11 @@ class PhyAIWorker(Worker):
             }
         return actions, result
 
-    def get_bootstrap_values(
-        self, final_obs: dict[str, Any] | None
-    ) -> torch.Tensor | None:
-        """Compute the final-observation value for native GAE."""
-        if final_obs is None or self.only_eval:
-            return None
-        with torch.no_grad():
-            _, result = self.predict(final_obs, mode="train")
-        values = result["prev_values"]
-        if values is None:
-            raise RuntimeError(
-                "PhyAI training rollout did not return bootstrap values."
-            )
-        return values[:, :1].cpu().contiguous()
-
     # Channel loops are backend-owned so PhyAI does not depend on HF worker state.
 
-    @property
-    def collect_raw_transition_obs(self) -> bool:
-        return self.collect_transitions
-
     @staticmethod
-    def _infer_env_batch_size(obs_batch: dict[str, Any]) -> int:
-        return infer_obs_batch_size(obs_batch)
-
-    @classmethod
-    def _infer_policy_input_batch_size(cls, policy_input: PolicyInput) -> int:
-        return cls._infer_env_batch_size(policy_input.obs)
+    def _infer_policy_input_batch_size(policy_input: PolicyInput) -> int:
+        return infer_obs_batch_size(policy_input.obs)
 
     @staticmethod
     def _decompress_policy_input(policy_input: PolicyInput) -> PolicyInput:
@@ -905,9 +834,7 @@ class PhyAIWorker(Worker):
             infer_batch_size_fn=self._infer_policy_input_batch_size,
         ).async_wait()
 
-    def _build_policy_output(
-        self, actions: torch.Tensor, result: dict[str, Any]
-    ) -> PolicyOutput:
+    def _build_policy_output(self, result: dict[str, Any]) -> PolicyOutput:
         return PolicyOutput(
             prev_logprobs=result["prev_logprobs"] if self.collect_prev_infos else None,
             prev_values=result["prev_values"] if self.collect_prev_infos else None,
@@ -939,7 +866,7 @@ class PhyAIWorker(Worker):
                 final_prev_values = values.cpu().contiguous()
         actor_channel.put(
             env_part.complete(
-                next_obs=(next_obs if self.collect_raw_transition_obs else None),
+                next_obs=(next_obs if self.collect_transitions else None),
                 next_rlt_obs=None,
                 final_prev_values=final_prev_values,
             ),
@@ -959,7 +886,7 @@ class PhyAIWorker(Worker):
         needs_policy_obs = any(
             part is not None
             and (
-                self.collect_raw_transition_obs
+                self.collect_transitions
                 or (part.requires_inference and part.next_obs is None)
             )
             for part in policy_input.env_parts
@@ -1016,11 +943,9 @@ class PhyAIWorker(Worker):
                     policy_output = None
                 else:
                     actions, result = self.predict(policy_input.obs, mode="train")
-                    policy_output = self._build_policy_output(actions, result)
+                    policy_output = self._build_policy_output(result)
                 self._send_actions(output_channel, actions.contiguous(), stage_id)
-                transition_obs = (
-                    policy_input.obs if self.collect_raw_transition_obs else {}
-                )
+                transition_obs = policy_input.obs if self.collect_transitions else {}
                 if policy_input.requires_inference:
                     trajectory_part = PolicyPart(
                         sources=policy_input.sources,
@@ -1063,25 +988,7 @@ class PhyAIWorker(Worker):
             )
 
     @staticmethod
-    def _merge_optional_flag_tensors(
-        obs_dicts: list[dict[str, Any]],
-        flags_list: list[torch.Tensor | None],
-    ) -> torch.Tensor | None:
-        if not any(flags is not None for flags in flags_list):
-            return None
-        ref_flags = next(flags for flags in flags_list if flags is not None)
-        filled_flags = []
-        for obs_dict, flags in zip(obs_dicts, flags_list):
-            if flags is None:
-                batch_size = infer_obs_batch_size(obs_dict)
-                fill_shape = (batch_size, *ref_flags.shape[1:])
-                filled_flags.append(torch.zeros(fill_shape, dtype=ref_flags.dtype))
-            else:
-                filled_flags.append(flags)
-        return torch.cat(filled_flags, dim=0)
-
-    @classmethod
-    def _merge_obs_batches(cls, obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
+    def _merge_obs_batches(obs_batches: list[dict[str, Any]]) -> dict[str, Any]:
         if not obs_batches:
             return {}
         obs_batches = [decompress_obs(obs_batch) for obs_batch in obs_batches]
@@ -1089,43 +996,19 @@ class PhyAIWorker(Worker):
             obs_batch["obs"] if "obs" in obs_batch else obs_batch
             for obs_batch in obs_batches
         ]
-        final_obs_list = [obs_batch.get("final_obs") for obs_batch in obs_batches]
-
-        def merge_obs_dicts(dicts: list[dict[str, Any]]) -> dict[str, Any]:
-            merged: dict[str, Any] = {}
-            for key in dicts[0]:
-                values = [obs_dict[key] for obs_dict in dicts]
-                first = next((value for value in values if value is not None), None)
-                if first is None:
-                    merged[key] = None
-                elif isinstance(first, torch.Tensor):
-                    merged[key] = torch.cat(values, dim=0)
-                elif isinstance(first, list):
-                    merged[key] = [item for value in values for item in value]
-                else:
-                    merged[key] = values
-            return merged
-
-        merged_final_obs = None
-        if any(final_obs is not None for final_obs in final_obs_list):
-            merged_final_obs = merge_obs_dicts(
-                [
-                    final_obs if final_obs is not None else obs_dict
-                    for obs_dict, final_obs in zip(obs_dicts, final_obs_list)
-                ]
-            )
-        return {
-            "obs": merge_obs_dicts(obs_dicts),
-            "final_obs": merged_final_obs,
-            "rlt_switch_flags": cls._merge_optional_flag_tensors(
-                obs_dicts,
-                [obs_batch.get("rlt_switch_flags") for obs_batch in obs_batches],
-            ),
-            "intervene_flags": cls._merge_optional_flag_tensors(
-                obs_dicts,
-                [obs_batch.get("intervene_flags") for obs_batch in obs_batches],
-            ),
-        }
+        merged: dict[str, Any] = {}
+        for key in obs_dicts[0]:
+            values = [obs_dict[key] for obs_dict in obs_dicts]
+            first = next((value for value in values if value is not None), None)
+            if first is None:
+                merged[key] = None
+            elif isinstance(first, torch.Tensor):
+                merged[key] = torch.cat(values, dim=0)
+            elif isinstance(first, list):
+                merged[key] = [item for value in values for item in value]
+            else:
+                merged[key] = values
+        return {"obs": merged}
 
     @Worker.timer("evaluate")
     async def evaluate(self, input_channel: Channel, output_channel: Channel) -> None:
@@ -1144,7 +1027,7 @@ class PhyAIWorker(Worker):
                         async_op=True,
                         batch_size=self.eval_batch_size,
                         merge_fn=self._merge_obs_batches,
-                        infer_batch_size_fn=self._infer_env_batch_size,
+                        infer_batch_size_fn=infer_obs_batch_size,
                     ).async_wait()
                     actions, _ = self.predict(env_output["obs"], mode="eval")
                     self.send_to(
